@@ -198,6 +198,15 @@ No `deviceClassName`, no topology attributes, no ResourceClaim authoring.
 // requestName to assemble the claim's device requests and topology
 // constraints.
 type ManagedClaim struct {
+	// ControllerName identifies which controller handles this managed
+	// claim. When omitted or empty, KubeVirt's built-in controller
+	// generates the claim using device declarations and align policies.
+	// When set, an external controller watches for VMIs with its name
+	// and implements custom claim generation logic.
+	// This field is immutable after creation.
+	// +optional
+	ControllerName string `json:"controllerName,omitempty"`
+
 	// Align specifies topology attributes for device co-placement.
 	// Each entry becomes a matchAttribute constraint spanning all
 	// device requests in the generated claim.
@@ -209,6 +218,8 @@ type ManagedClaim struct {
 	// Fully-qualified attribute names are passed through unchanged.
 	//
 	// When omitted or empty, no topology constraints are applied.
+	// Used by the built-in controller. External controllers may
+	// ignore this field and implement their own policy model.
 	// +optional
 	// +listType=atomic
 	Align []string `json:"align,omitempty"`
@@ -270,7 +281,7 @@ type GPU struct {
 	DeviceClassName string `json:"deviceClassName,omitempty"`
 
 	// Count specifies how many GPUs of this type to request.
-	// When set, the webhook expands this entry into Count individual
+	// When set, the controller expands this entry into Count individual
 	// GPU entries named <name>-0 through <name>-<count-1>, each with
 	// requestName <requestName>-0 through <requestName>-<count-1>.
 	// Defaults to 1 when omitted.
@@ -299,7 +310,7 @@ type HostDevice struct {
 	DeviceClassName string `json:"deviceClassName,omitempty"`
 
 	// Count specifies how many host devices of this type to request.
-	// When set, the webhook expands this entry into Count individual
+	// When set, the controller expands this entry into Count individual
 	// entries named <name>-0 through <name>-<count-1>.
 	// Defaults to 1 when omitted.
 	// +optional
@@ -327,7 +338,7 @@ type NetworkClaimRequest struct {
 	DeviceClassName string `json:"deviceClassName,omitempty"`
 
 	// Count specifies how many network devices of this type to request.
-	// When set, the webhook expands this entry into Count individual
+	// When set, the controller expands this entry into Count individual
 	// entries named <name>-0 through <name>-<count-1>.
 	// Defaults to 1 when omitted.
 	// +optional
@@ -408,27 +419,159 @@ GenerateManagedClaim(vmi, claimEntry) → ResourceClaim:
 
 ### Where Generation Happens
 
-Claim generation runs in the **VMI mutating webhook**
-(`pkg/virt-api/webhooks/mutating-webhook/mutators/vmi-mutator.go`), in
-`ApplyNewVMIMutations`, after defaults are applied.
+Claim generation runs in **virt-controller** as a reconciliation loop,
+not in the mutating webhook. The VMI is persisted with `managedClaim`
+in the spec. The controller creates ResourceClaims asynchronously.
+
+This follows the same pattern KubeVirt uses for backend storage PVCs
+(`pkg/storage/backend-storage/backend-storage.go`): the controller
+creates owned resources, tracks them via expectations, and waits for
+readiness before proceeding with pod creation.
+
+**Why controller, not webhook:**
+
+- No API calls during admission — creating ResourceClaims in a webhook
+  blocks the user's request and is an anti-pattern
+- No leaked objects — if VMI creation fails, no ResourceClaims were
+  created. If the controller creates a claim and the VMI is later
+  deleted, owner reference GC cleans up automatically
+- Retry on failure — the controller reconciles automatically
+- Follows established KubeVirt patterns (backend storage PVCs use the
+  same approach)
+
+**VMI sync flow integration:**
+
+Managed claim handling is inserted into the VMI sync loop
+(`pkg/virt-controller/watch/vmi/lifecycle.go`) after topology hints
+and before backend storage:
+
+```
+sync() → check deletionTimestamp → check dataVolumes →
+  check topologyHints → handleManagedClaims() [NEW] →
+  wait claimExpectations [NEW] → wait managedClaimsReady [NEW] →
+  handleBackendStorage() → wait backendStorageReady →
+  RenderLaunchManifest() → createPod()
+```
 
 For each `spec.resourceClaims[]` entry with `managedClaim != nil`:
 
-1. Call `GenerateManagedClaim` to build the `ResourceClaim`.
-2. Create the `ResourceClaim` in the Kubernetes API server.
-3. Replace `managedClaim` with `resourceClaimName` pointing to the
-   generated claim.
+1. If `controllerName` is empty (built-in controller):
+   a. Call `GenerateManagedClaim` to build the `ResourceClaim`.
+   b. Create the `ResourceClaim` in the API server with ownerReference
+      to the VMI.
+   c. Record the generated claim name in VMI status.
+2. If `controllerName` is set (external controller):
+   a. Skip — the external controller is responsible for creating the
+      claim.
+   b. Check VMI status for the external controller's completion signal.
+3. Once all managed claims are resolved (status shows all claims
+   created), proceed with pod creation.
 
-After mutation, the persisted VMI contains only `resourceClaimName`
-references — virt-controller and virt-launcher never see `managedClaim`.
-The entire DRA pipeline (scheduler allocation, driver preparation,
-virt-launcher metadata reading) works unchanged.
+### Status Tracking
 
-**Why webhook, not virt-controller:**
+A new `ManagedClaims` field on `VirtualMachineInstanceStatus` tracks
+the lifecycle of each managed claim:
 
-- Synchronous error reporting — the user sees admission errors immediately
-- No reconciliation loop — the claim exists before the VMI is persisted
-- Simpler lifecycle — no controller state to manage
+```go
+type VirtualMachineInstanceStatus struct {
+	// ... existing fields ...
+
+	// ManagedClaims tracks the status of managed ResourceClaim
+	// generation for each spec.resourceClaims[] entry that uses
+	// managedClaim.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	ManagedClaims []ManagedClaimStatus `json:"managedClaims,omitempty"`
+}
+
+type ManagedClaimStatus struct {
+	// Name matches the spec.resourceClaims[].name entry.
+	Name string `json:"name"`
+
+	// ResourceClaimName is the name of the generated ResourceClaim.
+	ResourceClaimName string `json:"resourceClaimName,omitempty"`
+
+	// ControllerName identifies which controller created the claim.
+	ControllerName string `json:"controllerName,omitempty"`
+
+	// Phase indicates the current lifecycle phase.
+	Phase ManagedClaimPhase `json:"phase"`
+
+	// Message provides human-readable details about the current phase.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+type ManagedClaimPhase string
+
+const (
+	// ManagedClaimPending indicates the claim has not been created yet.
+	ManagedClaimPending ManagedClaimPhase = "Pending"
+	// ManagedClaimCreated indicates the ResourceClaim exists.
+	ManagedClaimCreated ManagedClaimPhase = "Created"
+	// ManagedClaimFailed indicates claim creation failed.
+	ManagedClaimFailed  ManagedClaimPhase = "Failed"
+)
+```
+
+The controller checks readiness before proceeding with pod creation:
+all managed claims must be in the `Created` phase and the corresponding
+ResourceClaim must exist with an ownerReference to the VMI.
+
+### Expectations Pattern
+
+The controller uses `UIDTrackingControllerExpectations` (the same
+mechanism used for pod and PVC creation) to avoid reconciling before
+the informer cache reflects newly created ResourceClaims:
+
+- `claimExpectations.ExpectCreations(vmiKey, count)` before creating
+  claims
+- `claimExpectations.CreationObserved(vmiKey)` when the ResourceClaim
+  informer sees the new object
+- `claimExpectations.SatisfiedExpectations(vmiKey)` checked in the
+  sync loop before proceeding
+
+A ResourceClaim informer is added to the VMI controller, with event
+handlers that observe creation expectations and enqueue the owning VMI
+for reconciliation.
+
+### External Controller Contract
+
+When `controllerName` is set, an external controller is responsible for
+creating the ResourceClaim. The contract:
+
+**What the external controller must do:**
+
+1. Watch for VMIs where
+   `spec.resourceClaims[].managedClaim.controllerName` matches its name
+2. Create a `ResourceClaim` in the VMI's namespace
+3. Set `ownerReference` on the claim pointing to the VMI with
+   `controller: true` (required for GC)
+4. Update the VMI status by setting the corresponding
+   `status.managedClaims[]` entry to phase `Created` with the generated
+   `resourceClaimName`
+
+**What virt-controller does for external claims:**
+
+1. Skips claim generation for entries where `controllerName` is set
+2. Reads `status.managedClaims[]` to check if the external controller
+   has completed
+3. Validates that the referenced ResourceClaim exists and has a correct
+   ownerReference to the VMI
+4. Proceeds with pod creation once all managed claims are resolved
+
+**Timeout:** if an external controller does not create the claim within
+5 minutes, virt-controller emits a `ManagedClaimTimeout` event on the
+VMI explaining which controller has not responded. The VMI stays in a
+pending state (it is not rejected — the controller may start later).
+
+**Conflict avoidance:** the built-in controller skips any managed claim
+where `controllerName` is non-empty. External controllers must only
+process claims matching their own `controllerName`.
+
+**Immutability:** `controllerName` is immutable after VMI creation. The
+validating webhook rejects updates that change this field.
 
 ### Implementation Details
 
@@ -437,21 +580,41 @@ virt-launcher metadata reading) works unchanged.
 limit, the name is truncated and a short hash suffix is appended to
 preserve uniqueness.
 
-**Idempotency:** if the webhook is retried (e.g., due to a transient
-error), the second `CREATE` call may return `AlreadyExists`. The webhook
-handles this by verifying the existing claim's owner reference matches the
-VMI. If it does, the webhook proceeds; if it doesn't, the VMI is rejected.
+**Idempotency:** controller reconciliation is naturally idempotent. If
+the ResourceClaim already exists with the correct ownerReference, the
+controller skips creation and updates status to `Created`.
 
-**RBAC:** the virt-api ClusterRole must be updated to grant `create` and
-`delete` permissions on `resourceclaims` in the `resource.k8s.io` API
-group. `delete` is needed for cleanup if claim creation succeeds but the
-VMI admission is later rejected by the validating webhook.
+**RBAC:** virt-controller's ClusterRole is updated to grant `create`,
+`get`, `list`, `watch`, and `delete` permissions on `resourceclaims` in
+the `resource.k8s.io` API group. virt-controller already has broad
+permissions for pod and PVC management.
 
 **Multiple managed claims per VMI:** a VMI can have multiple
 `resourceClaims[]` entries, each independently using `managedClaim`,
-`resourceClaimName`, or `resourceClaimTemplateName`. For example, one
-managed claim for GPUs aligned on `pcieRoot` and a separate managed claim
-for CPUs with no alignment. Each generates its own `ResourceClaim`.
+`resourceClaimName`, or `resourceClaimTemplateName`. Each managed claim
+entry is reconciled independently. Pod creation waits for all of them.
+
+### Error Handling
+
+**Claim generation failure:** if the built-in controller cannot generate
+a claim (e.g., no DeviceClassName resolvable, no devices reference the
+claim), it sets the status phase to `Failed` with a descriptive message
+and emits a `FailedCreateResourceClaim` event on the VMI. The VMI stays
+pending; the controller retries on the next reconciliation.
+
+**ResourceClaim deleted externally:** if a managed claim's ResourceClaim
+is deleted while the VMI is running, the controller detects this via the
+informer and re-creates the claim (built-in controller) or emits a
+warning event (external controller).
+
+**External controller timeout:** if `controllerName` is set and the
+claim is not created within 5 minutes, the controller emits a
+`ManagedClaimTimeout` event. The VMI stays pending.
+
+**VMI deletion during claim creation:** the controller checks
+`vmi.DeletionTimestamp` before creating claims. If the VMI is being
+deleted, the controller skips claim creation. Owner reference GC handles
+cleanup of any already-created claims.
 
 ### Shorthand Expansion
 
@@ -728,7 +891,8 @@ API server queries.
 - API changes behind `ManagedDRAClaims` feature gate (off by default)
 - GPU, HostDevice, Network, and CPU support
 - Topology alignment with `align: [numaNode]` and `align: [pcieRoot]`
-- Webhook-based claim generation
+- Controller-based claim generation with status tracking
+- External controller extensibility via `controllerName`
 - Validation
 - Unit tests and mock e2e tests
 - Requires KEP-6072 (GA in Kubernetes 1.37)
