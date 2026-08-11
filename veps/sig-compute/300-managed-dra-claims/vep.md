@@ -694,43 +694,6 @@ DRA driver publishes `pcieRoot` as a list attribute (KEP-5491). The
 scheduler's set-intersection semantics match the CPU group's PCIe root
 list against the GPU and NIC scalar values.
 
-### VM with Persistent Managed Claim
-
-```yaml
-apiVersion: kubevirt.io/v1
-kind: VirtualMachine
-metadata:
-  name: persistent-gpu-vm
-spec:
-  running: true
-  resourceClaimTemplates:
-  - name: my-gpu
-    resourceClaimTemplateName: my-gpu-template
-    persistWhenStopped: true
-  template:
-    spec:
-      resourceClaims:
-      - name: my-gpu
-        managedClaim:
-          align: [numaNode]
-      domain:
-        cpu:
-          cores: 8
-          dra:
-            claimName: my-gpu
-            requestName: cpus
-            deviceClassName: cpu.dra.k8s.io
-        devices:
-          gpus:
-          - name: gpu0
-            claimName: my-gpu
-            requestName: gpu
-            deviceClassName: gpu.nvidia.com
-        resources:
-          requests:
-            memory: 32Gi
-```
-
 ## Scalability
 
 Managed claim generation adds one `ResourceClaim` CREATE per managed claim
@@ -800,7 +763,6 @@ API server queries.
 - [VEP-115: PCIe NUMA Topology Awareness](../115-pcie-numa-topology-awareness/pcie-numa-topology-awareness.md)
 - [VEP-152: Support CPUs with DRA](../152-cpu-dra/vep.md)
 - [VEP-183: DRA for Network Devices](../../sig-network/183-dra-network/vep.md)
-- [VEP-344: VM-Scoped Persistent ResourceClaims](../344-vm-scoped-persistent-resource-claims/vep.md)
 - [KEP-6072: Standard Topology Attributes](https://github.com/kubernetes/enhancements/issues/6072)
 - [KEP-5491: List Types for Attributes](https://github.com/kubernetes/enhancements/issues/5491)
 - [KEP-5304: DRA Device Attributes Downward API](https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/5304-dra-attributes-downward-api)
