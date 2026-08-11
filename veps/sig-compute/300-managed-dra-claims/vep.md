@@ -753,8 +753,6 @@ API server queries.
 - **Memory and hugepages:** when the CPU DRA driver adds memory allocation
   support, memory can participate in managed claims, enabling full
   GPU + NIC + CPU + memory co-placement on the same NUMA node
-- **DRADevicePolicy CRD:** reusable policies across VMIs, referenced by
-  name instead of inline `align`
 
 ## References
 
