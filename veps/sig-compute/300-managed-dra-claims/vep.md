@@ -85,8 +85,6 @@ same NUMA node — the most common topology request for AI/HPC workloads.
   root without learning DRA claim syntax
 - As a user, I want to request GPUs, NICs, and CPUs on the same NUMA node
   with a single topology declaration
-- As a user, I want my managed claims to persist across VM stop/start so
-  I keep the same physical GPU
 - As an admin, I want to configure default DeviceClasses so users don't
   need to know driver-specific class names
 - As an admin, I want users to be able to override defaults when they need
