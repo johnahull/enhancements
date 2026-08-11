@@ -419,25 +419,12 @@ GenerateManagedClaim(vmi, claimEntry) → ResourceClaim:
 
 ### Where Generation Happens
 
-Claim generation runs in **virt-controller** as a reconciliation loop,
-not in the mutating webhook. The VMI is persisted with `managedClaim`
-in the spec. The controller creates ResourceClaims asynchronously.
-
-This follows the same pattern KubeVirt uses for backend storage PVCs
-(`pkg/storage/backend-storage/backend-storage.go`): the controller
-creates owned resources, tracks them via expectations, and waits for
-readiness before proceeding with pod creation.
-
-**Why controller, not webhook:**
-
-- No API calls during admission — creating ResourceClaims in a webhook
-  blocks the user's request and is an anti-pattern
-- No leaked objects — if VMI creation fails, no ResourceClaims were
-  created. If the controller creates a claim and the VMI is later
-  deleted, owner reference GC cleans up automatically
-- Retry on failure — the controller reconciles automatically
-- Follows established KubeVirt patterns (backend storage PVCs use the
-  same approach)
+Claim generation runs in **virt-controller** as a reconciliation loop.
+The VMI is persisted with `managedClaim` in the spec. The controller
+creates ResourceClaims asynchronously, tracks them via expectations,
+and waits for readiness before proceeding with pod creation. This
+follows the same pattern KubeVirt uses for backend storage PVCs
+(`pkg/storage/backend-storage/backend-storage.go`).
 
 **VMI sync flow integration:**
 
