@@ -239,7 +239,7 @@ type VirtualMachineInstanceResourceClaim struct {
 
 #### Modified: `GPU`
 
-Add optional `DeviceClassName` and `Count`:
+Two new fields added by this VEP (`DeviceClassName` and `Count`):
 
 ```go
 type GPU struct {
@@ -267,7 +267,7 @@ type GPU struct {
 
 #### Modified: `HostDevice`
 
-Add optional `DeviceClassName` and `Count`:
+Two new fields added by this VEP (`DeviceClassName` and `Count`):
 
 ```go
 type HostDevice struct {
@@ -293,9 +293,32 @@ type HostDevice struct {
 
 #### CPU (`CPUDRASource`, defined by VEP-152)
 
-VEP-152 adds `DeviceClassName` to `CPUDRASource`. When omitted, the
-provisioner's `cpu.deviceClassName` is used. VEP-300 scans it during
-claim generation alongside the other device types.
+VEP-152 adds the following structure (shown here for reference):
+
+```go
+type CPU struct {
+	// ... existing fields (Cores, Sockets, Threads, etc.) ...
+
+	// DRA enables Dynamic Resource Allocation for CPU resources.
+	// +optional
+	DRA *CPUDRASource `json:"dra,omitempty"`
+}
+
+type CPUDRASource struct {
+	// ClaimName references an entry in spec.resourceClaims[].
+	ClaimName string `json:"claimName,omitempty"`
+	// RequestName identifies the request within the ResourceClaim.
+	RequestName string `json:"requestName,omitempty"`
+	// DeviceClassName overrides the provisioner's cpu.deviceClassName.
+	// +optional
+	DeviceClassName string `json:"deviceClassName,omitempty"`
+}
+```
+
+When `DeviceClassName` is omitted, the provisioner's
+`cpu.deviceClassName` is used. VEP-300 scans `cpu.dra` during claim
+generation alongside the other device types. The CPU count in the
+generated claim is derived from VEP-152's accounting formula.
 
 ### DeviceClassName Resolution
 
@@ -320,11 +343,10 @@ appears in:
 GenerateManagedClaim(vmi, claimEntry, provisioner) → ResourceClaim:
 
   1. Expand device counts:
-     - For each GPU, HostDevice, or network device with
-       count > 1, expand into individual entries: name-0
-       through name-(count-1), requestName-0 through
-       requestName-(count-1). Each inherits deviceClassName
-       from the original entry.
+     - For each GPU or HostDevice with count > 1, expand into
+       individual entries: name-0 through name-(count-1),
+       requestName-0 through requestName-(count-1). Each
+       inherits deviceClassName from the original entry.
 
   2. Collect device requests:
      a. Scan domain.devices.gpus[] (after expansion) — for each
@@ -569,6 +591,7 @@ The validating webhook enforces:
    a managed claim.
 8. **Valid align entries:** each `align` value must be a known shorthand
    or a valid fully-qualified attribute name.
+9. **Valid count values:** `count` must be >= 1. Values <= 0 are rejected.
 
 ### Error Handling
 
@@ -639,6 +662,8 @@ apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
   name: gpu-vm-my-gpu
+  labels:
+    kubevirt.io/managed-claim: my-gpu
   ownerReferences:
   - apiVersion: kubevirt.io/v1
     kind: VirtualMachineInstance
@@ -709,6 +734,8 @@ apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
   name: gpu-nic-vm-aligned-devices
+  labels:
+    kubevirt.io/managed-claim: aligned-devices
 spec:
   devices:
     requests:
@@ -790,6 +817,8 @@ apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
   name: full-topology-vm-all-devices
+  labels:
+    kubevirt.io/managed-claim: all-devices
 spec:
   devices:
     requests:
