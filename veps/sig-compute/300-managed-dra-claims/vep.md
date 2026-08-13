@@ -66,8 +66,6 @@ declare their devices. The provisioner controller assembles the
 
 - Replace explicit `resourceClaimName` or `resourceClaimTemplateName`
   references (these remain as power-user escape hatches)
-- Partition mode where the provisioner defines device counts and the
-  user omits device declarations (future extension)
 - Define CPU consumption behavior (owned by VEP-152)
 - Define guest NUMA topology construction (owned by VEP-115)
 - Support live migration of DRA-backed devices
@@ -304,12 +302,15 @@ type CPU struct {
 	DRA *CPUDRASource `json:"dra,omitempty"`
 }
 
+// CPUDRASource as defined by VEP-152, with DeviceClassName added
+// by this VEP for managed claim support.
 type CPUDRASource struct {
-	// ClaimName references an entry in spec.resourceClaims[].
-	ClaimName string `json:"claimName,omitempty"`
-	// RequestName identifies the request within the ResourceClaim.
-	RequestName string `json:"requestName,omitempty"`
+	// ClaimRequest references a specific request from a ResourceClaim
+	// listed in vmi.spec.resourceClaims[].
+	*ClaimRequest `json:",inline"`
+
 	// DeviceClassName overrides the provisioner's cpu.deviceClassName.
+	// Added by VEP-300 for managed claim support.
 	// +optional
 	DeviceClassName string `json:"deviceClassName,omitempty"`
 }
@@ -318,7 +319,9 @@ type CPUDRASource struct {
 When `DeviceClassName` is omitted, the provisioner's
 `cpu.deviceClassName` is used. VEP-300 scans `cpu.dra` during claim
 generation alongside the other device types. The CPU count in the
-generated claim is derived from VEP-152's accounting formula.
+generated claim is derived from VEP-152's accounting formula
+(`cores × sockets × threads + emulatorThreadCPUs + supplementalPoolThreadCount`).
+See [VEP-152 CPU accounting](../152-cpu-dra/vep.md) for details.
 
 ### DeviceClassName Resolution
 
@@ -504,7 +507,9 @@ for reconciliation.
 
 When the provisioner's `provisioner` field does not match the built-in
 controller, an external controller is responsible for creating the
-ResourceClaim. The contract:
+ResourceClaim. This follows the CSI provisioner pattern: the external
+controller creates the resource, and virt-controller observes it and
+updates VMI status. Only virt-controller writes VMI status.
 
 **What the external controller must do:**
 
@@ -513,18 +518,18 @@ ResourceClaim. The contract:
 2. Create a `ResourceClaim` in the VMI's namespace
 3. Set `ownerReference` on the claim pointing to the VMI with
    `controller: true` (required for GC)
-4. Update the VMI status by setting the corresponding
-   `status.managedClaims[]` entry to phase `Created` with the generated
-   `resourceClaimName`
+
+The external controller does not write VMI status. It only creates the
+ResourceClaim.
 
 **What virt-controller does for external claims:**
 
 1. Skips claim generation for entries where `provisioner` does not
    match the built-in controller
-2. Reads `status.managedClaims[]` to check if the external controller
-   has completed
-3. Validates that the referenced ResourceClaim exists and has a correct
-   ownerReference to the VMI
+2. Watches for ResourceClaims owned by the VMI via the ResourceClaim
+   informer
+3. When a matching ResourceClaim appears, validates ownership and
+   updates VMI `status.managedClaims[]` to phase `Created`
 4. Proceeds with pod creation once all managed claims are resolved
 
 **Timeout:** if an external controller does not create the claim within
@@ -878,6 +883,64 @@ spec:
 
 The user's `deviceClassName: gpu.amd.com` overrides the provisioner's
 `gpus.deviceClassName: gpu.nvidia.com`.
+
+## Alternatives
+
+### Alternative 1: Inline `managedClaim` on VMI spec
+
+The initial design (from
+[VEP-10 Appendix C](../10-dra-devices/vep.md#c-managed-resource-claims))
+placed topology policy (`align`) and DeviceClass names directly on the
+VMI spec via a `managedClaim` field on `resourceClaims[]` and
+`deviceClassName` on each device declaration. Admin defaults were
+configured in the KubeVirt CR (`managedClaimDefaults`).
+
+Rejected because:
+- DeviceClass names and topology policy are admin concerns, not user
+  concerns. Putting them in the VMI leaks infrastructure details.
+- No extensibility for external controllers without adding a
+  `controllerName` field (which duplicates what the CRD's `provisioner`
+  field does more cleanly).
+- Admin defaults in the KubeVirt CR are a single global config. The
+  CRD allows multiple provisioner profiles per cluster.
+
+### Alternative 2: Webhook-based claim generation
+
+The claim generation logic runs in a mutating admission webhook instead
+of a controller. The webhook creates the ResourceClaim during VMI
+admission and replaces `managedClaim` with `resourceClaimName` before
+the VMI is persisted.
+
+Rejected because:
+- Creating Kubernetes objects during admission is an anti-pattern
+  (blocks the request, can leak objects if a downstream webhook
+  rejects the VMI).
+- No retry on failure (webhook fails, VMI creation fails).
+- Kubernetes made the same decision when implementing DRA extended
+  resources in the scheduler instead of a webhook.
+
+### Alternative 3: No KubeVirt involvement (external-only)
+
+Users install an external controller (e.g., topology coordinator) that
+watches VMIs and generates ResourceClaims independently. KubeVirt has
+no managed claim API at all.
+
+Rejected because:
+- No standard contract between KubeVirt and external controllers
+  (how does virt-controller know when to proceed with pod creation?).
+- Every external implementation reinvents the same integration
+  (status tracking, expectations, ownership).
+- KubeVirt should provide a built-in default implementation while
+  allowing external extensibility via the `provisioner` field.
+
+## Implementation History
+
+- 2026-08-05: Initial VEP draft based on VEP-10 Appendix C design
+- 2026-08-11: Redesigned with ManagedClaimProvisioner CRD based on
+  feedback from Alay Patel (VEP owner)
+- 2026-08-12: Added controller-based generation, external controller
+  contract, status tracking
+- 2026-08-13: Aligned CPUDRASource with VEP-152
 
 ## Scalability
 
