@@ -5,7 +5,7 @@ authors:
 owning-sig: sig-node
 participating-sigs:
   - sig-scheduling
-status: implementable
+status: implemented
 creation-date: 2026-05-12
 reviewers:
   - "@ffromani"
