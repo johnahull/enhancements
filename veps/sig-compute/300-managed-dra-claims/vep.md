@@ -161,20 +161,25 @@ spec:
   # Third-party controllers use their own name.
   provisioner: policy.kubevirt.io/aligner
 
-  # DeviceClass mappings per device type.
-  # One DeviceClass per type for Alpha.
-  # +optional
-  cpu:
+  # DeviceClass mappings and optional DRA configuration.
+  # Each name is one of cpu, gpu, hostDevice, or network.
+  deviceTypes:
+  - name: cpu
     deviceClassName: cpu.dra.k8s.io
-  # +optional
-  gpus:
-    deviceClassName: gpu.nvidia.com
-  # +optional
-  hostDevices:
+  - name: gpu
+    deviceClassName: gpu.example.com
+    opaque:
+      driver: gpu.example.com
+      parameters:
+        apiVersion: gpu.example.com/v1alpha1
+        kind: GPUConfig
+        iommu:
+          backendPolicy: LegacyOnly
+          enableAPIDevice: true
+  - name: hostDevice
     deviceClassName: pci.example.com
-  # +optional
-  networks:
-    deviceClassName: sriov.mellanox.com
+  - name: network
+    deviceClassName: sriov.example.com
 ```
 
 The provisioner receives the managed claim entry and every VMI device
@@ -183,6 +188,32 @@ that references it. The provisioner chooses the generated
 [`DeviceConstraint`](https://kubernetes.io/docs/reference/kubernetes-api/resource/resource-claim-v1/#DeviceConstraint)
 objects. KubeVirt does not expose provisioner-specific constraint or
 pairing policy in `ManagedClaimProvisioner.spec`.
+
+`deviceTypes` is a named list. The name maps VMI device declarations to
+the provisioner configuration: `cpu` maps to `domain.cpu.dra`, `gpu` to
+`domain.devices.gpus[]`, `hostDevice` to `domain.devices.hostDevices[]`,
+and `network` to `spec.networks[].resourceClaim`.
+
+`opaque` is optional driver-specific configuration. When present, the
+provisioner renders a Kubernetes `DeviceClaimConfiguration` in
+`ResourceClaim.spec.devices.config`, with `requests` set to every
+generated request for that device type and `opaque` copied from the
+provisioner. This follows the ResourceClaim configuration model used
+for KubeVirt GPU DRA claims.
+
+```go
+type ManagedClaimProvisionerSpec struct {
+	// +listType=map
+	// +listMapKey=name
+	DeviceTypes []ManagedClaimDeviceType `json:"deviceTypes"`
+}
+
+type ManagedClaimDeviceType struct {
+	Name            string `json:"name"`
+	DeviceClassName string `json:"deviceClassName"`
+	Opaque          *resourcev1.OpaqueDeviceConfiguration `json:"opaque,omitempty"`
+}
+```
 
 #### Modified: `VirtualMachineInstanceResourceClaim`
 
@@ -256,10 +287,10 @@ DeviceClass names are defined in the `ManagedClaimProvisioner` CRD.
 The controller determines device type by which VMI field the device
 appears in:
 
-- `domain.devices.gpus[]` -> provisioner `spec.gpus.deviceClassName`
-- `domain.devices.hostDevices[]` -> provisioner `spec.hostDevices.deviceClassName`
-- `spec.networks[].resourceClaim` -> provisioner `spec.networks.deviceClassName`
-- `domain.cpu.dra` -> provisioner `spec.cpu.deviceClassName`
+- `domain.devices.gpus[]` -> `deviceTypes[name=gpu]`
+- `domain.devices.hostDevices[]` -> `deviceTypes[name=hostDevice]`
+- `spec.networks[].resourceClaim` -> `deviceTypes[name=network]`
+- `domain.cpu.dra` -> `deviceTypes[name=cpu]`
 
 ### Claim Generation Algorithm
 
@@ -269,17 +300,17 @@ GenerateClaim(managedClaimContext) -> ResourceClaimSpec:
   1. Collect device requests:
      a. Scan domain.devices.gpus[] - for each GPU where
         claimName == claimEntry.Name, look up DeviceClassName
-        from provisioner CRD gpus section, create a
+        from deviceTypes[name=gpu], create a
         DeviceRequest with Name=requestName,
         DeviceClassName=resolved, Count=1.
      b. Scan domain.devices.hostDevices[] - same pattern,
-        using provisioner hostDevices section.
+        using deviceTypes[name=hostDevice].
      c. Scan spec.networks[] - for each network where
         resourceClaim.claimName == claimEntry.Name, look up
-        DeviceClassName from provisioner networks section,
+        DeviceClassName from deviceTypes[name=network],
         create a DeviceRequest.
      d. Scan domain.cpu.dra (VEP-152) - if claimName matches,
-        look up DeviceClassName from provisioner cpu section,
+        look up DeviceClassName from deviceTypes[name=cpu],
         create a DeviceRequest with CPU count derived from
         VEP-152's accounting formula
         (cores x sockets x threads + emulator + IOThreads).
@@ -292,17 +323,22 @@ GenerateClaim(managedClaimContext) -> ResourceClaimSpec:
        provisioner CRD.
      - No duplicate requestName values.
 
-  3. The provisioner builds spec.devices.constraints from the full set
+  3. For each configured device type with opaque configuration, add a
+     DeviceClaimConfiguration with the generated request names for that
+     type and the configured opaque value.
+
+  4. The provisioner builds spec.devices.constraints from the full set
      of collected requests. The built-in provisioner applies its
      PCIe-root and NUMA topology policy. Other provisioner controllers
      define their own constraint-generation behavior.
 
-  4. Assemble ResourceClaim:
+  5. Assemble ResourceClaim:
      - Name: <vmi-name>-<claim-name>
      - Namespace: vmi.Namespace
      - OwnerReference: VMI (controller=true, for GC)
      - Labels: kubevirt.io/managed-claim: <claim-name>
      - Spec.Devices.Requests: collected requests
+     - Spec.Devices.Config: generated device configurations
      - Spec.Devices.Constraints: collected constraints
 ```
 
@@ -442,9 +478,10 @@ The validating webhook enforces:
    after VMI creation.
 5. **Device coverage:** at least one device declaration must reference
    each managed claim entry (no empty claims).
-6. **DeviceClassName available:** the provisioner CRD must have a
-   `deviceClassName` configured for every device type referenced by
-   devices in the managed claim.
+6. **Device type configuration:** `deviceTypes[].name` must be unique
+   and one of `cpu`, `gpu`, `hostDevice`, or `network`. Every device type
+   referenced by devices in the managed claim must have a non-empty
+   `deviceClassName`. When `opaque` is set, its `driver` must be set.
 7. **Unique request names:** no duplicate `requestName` values within
    a managed claim.
 ### Error Handling
@@ -482,8 +519,17 @@ metadata:
   name: gpu-default
 spec:
   provisioner: policy.kubevirt.io/aligner
-  gpus:
-    deviceClassName: gpu.nvidia.com
+  deviceTypes:
+  - name: gpu
+    deviceClassName: gpu.example.com
+    opaque:
+      driver: gpu.example.com
+      parameters:
+        apiVersion: gpu.example.com/v1alpha1
+        kind: GPUConfig
+        iommu:
+          backendPolicy: LegacyOnly
+          enableAPIDevice: true
 ```
 
 User creates VMI:
@@ -527,8 +573,18 @@ spec:
     requests:
     - name: gpu
       exactly:
-        deviceClassName: gpu.nvidia.com
+        deviceClassName: gpu.example.com
         count: 1
+    config:
+    - requests: [gpu]
+      opaque:
+        driver: gpu.example.com
+        parameters:
+          apiVersion: gpu.example.com/v1alpha1
+          kind: GPUConfig
+          iommu:
+            backendPolicy: LegacyOnly
+            enableAPIDevice: true
 ```
 
 ### GPU + NIC Co-Placed on PCIe Root
@@ -542,10 +598,11 @@ metadata:
   name: pcie-aligned
 spec:
   provisioner: policy.kubevirt.io/aligner
-  gpus:
-    deviceClassName: gpu.nvidia.com
-  networks:
-    deviceClassName: sriov.mellanox.com
+  deviceTypes:
+  - name: gpu
+    deviceClassName: gpu.example.com
+  - name: network
+    deviceClassName: sriov.example.com
 ```
 
 User creates VMI:
@@ -592,11 +649,11 @@ spec:
     requests:
     - name: gpu
       exactly:
-        deviceClassName: gpu.nvidia.com
+        deviceClassName: gpu.example.com
         count: 1
     - name: nic
       exactly:
-        deviceClassName: sriov.mellanox.com
+        deviceClassName: sriov.example.com
         count: 1
     constraints:
     - matchAttribute: resource.kubernetes.io/pcieRoot
@@ -614,12 +671,13 @@ metadata:
   name: hgx-b200-quarter
 spec:
   provisioner: policy.kubevirt.io/aligner
-  cpu:
+  deviceTypes:
+  - name: cpu
     deviceClassName: cpu.dra.k8s.io
-  gpus:
-    deviceClassName: gpu.nvidia.com
-  networks:
-    deviceClassName: sriov.mellanox.com
+  - name: gpu
+    deviceClassName: gpu.example.com
+  - name: network
+    deviceClassName: sriov.example.com
 ```
 
 User creates VMI:
@@ -674,15 +732,15 @@ spec:
     requests:
     - name: gpu0
       exactly:
-        deviceClassName: gpu.nvidia.com
+        deviceClassName: gpu.example.com
         count: 1
     - name: gpu1
       exactly:
-        deviceClassName: gpu.nvidia.com
+        deviceClassName: gpu.example.com
         count: 1
     - name: nic
       exactly:
-        deviceClassName: sriov.mellanox.com
+        deviceClassName: sriov.example.com
         count: 1
     - name: cpus
       exactly:
@@ -832,6 +890,7 @@ scalability model. See
 - [VEP-115: PCIe NUMA Topology Awareness](../115-pcie-numa-topology-awareness/pcie-numa-topology-awareness.md)
 - [VEP-152: Support CPUs with DRA](../152-cpu-dra/vep.md)
 - [VEP-183: DRA for Network Devices](../../sig-network/183-dra-network/vep.md)
+- [KubeVirt GPU DRA configuration](https://kubevirt.io/user-guide/compute/dra_gpu/)
 - [ResourceClaim DeviceConstraint](https://kubernetes.io/docs/reference/kubernetes-api/resource/resource-claim-v1/#DeviceConstraint)
 - [KEP-6072: Standard Topology Attributes](https://github.com/kubernetes/enhancements/issues/6072)
 - [KEP-5491: List Types for Attributes](https://github.com/kubernetes/enhancements/issues/5491)
