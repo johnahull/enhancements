@@ -120,9 +120,10 @@ VEP-152 and VEP-300 are developed concurrently:
 - **VEP-152 owns:** `cpu.dra` struct (`CPUDRASource`), `deviceClassName`
   on `CPUDRASource`, CPU consumption (virt-launcher vCPU pinning), CPU
   accounting formula, `CPUsWithDRA` feature gate, unified `dedicated` API
-- **VEP-300 owns:** `ManagedClaimProvisioner` CRD, `managedClaimProvisioner`
-  field on `VirtualMachineInstanceResourceClaim`, the managed-claim
-  provisioning framework, and the `ManagedDRAClaims` feature gate
+- **VEP-300 owns:** `ManagedClaimProvisioner` CRD,
+  `managedClaimProvisionerName` field on
+  `VirtualMachineInstanceResourceClaim`, the managed-claim provisioning
+  framework, and the `ManagedDRAClaims` feature gate
 
 VEP-152's future `autoClaim` path for CPU-only claims is superseded by
 VEP-300's managed claims, which handle CPUs as part of cross-device claims.
@@ -183,21 +184,9 @@ that references it. The provisioner chooses the generated
 objects. KubeVirt does not expose provisioner-specific constraint or
 pairing policy in `ManagedClaimProvisioner.spec`.
 
-#### New Type: `ManagedClaimProvisionerRef`
-
-```go
-// ManagedClaimProvisionerRef references a ManagedClaimProvisioner
-// object by name.
-type ManagedClaimProvisionerRef struct {
-	// Name is the name of the ManagedClaimProvisioner object.
-	// This field is immutable after creation.
-	Name string `json:"name"`
-}
-```
-
 #### Modified: `VirtualMachineInstanceResourceClaim`
 
-Add `ManagedClaimProvisioner` as a third mutually-exclusive option:
+Add `ManagedClaimProvisionerName` as a third mutually-exclusive option:
 
 ```go
 type VirtualMachineInstanceResourceClaim struct {
@@ -207,23 +196,24 @@ type VirtualMachineInstanceResourceClaim struct {
 	// ResourceClaimName is the name of a ResourceClaim object in the
 	// same namespace as this VMI.
 	// Exactly one of ResourceClaimName, ResourceClaimTemplateName, or
-	// ManagedClaimProvisioner must be set.
+	// ManagedClaimProvisionerName must be set.
 	ResourceClaimName *string `json:"resourceClaimName,omitempty"`
 
 	// ResourceClaimTemplateName is the name of a ResourceClaimTemplate
 	// object in the same namespace as this VMI.
 	// Exactly one of ResourceClaimName, ResourceClaimTemplateName, or
-	// ManagedClaimProvisioner must be set.
+	// ManagedClaimProvisionerName must be set.
 	ResourceClaimTemplateName *string `json:"resourceClaimTemplateName,omitempty"`
 
-	// ManagedClaimProvisioner references a ManagedClaimProvisioner
-	// object that controls how the ResourceClaim is generated.
+	// ManagedClaimProvisionerName references a cluster-scoped
+	// ManagedClaimProvisioner object that controls how the
+	// ResourceClaim is generated.
 	// The managed-claim framework passes VMI device declarations to
 	// the matching provisioner controller, which generates a ResourceClaim.
 	// Exactly one of ResourceClaimName, ResourceClaimTemplateName, or
-	// ManagedClaimProvisioner must be set.
+	// ManagedClaimProvisionerName must be set.
 	// +optional
-	ManagedClaimProvisioner *ManagedClaimProvisionerRef `json:"managedClaimProvisioner,omitempty"`
+	ManagedClaimProvisionerName *string `json:"managedClaimProvisionerName,omitempty"`
 }
 ```
 
@@ -371,7 +361,7 @@ managedclaim.NewController(
 ```
 
 For each `spec.resourceClaims[]` entry with
-`managedClaimProvisioner != nil` whose referenced
+`managedClaimProvisionerName != nil` whose referenced
 `ManagedClaimProvisioner.spec.provisioner` matches its configured name,
 the provisioner controller:
 
@@ -442,13 +432,13 @@ allocation waits for the corresponding claims.
 The validating webhook enforces:
 
 1. **Mutual exclusion:** exactly one of `resourceClaimName`,
-   `resourceClaimTemplateName`, or `managedClaimProvisioner` must be
-   set per `resourceClaims[]` entry.
+   `resourceClaimTemplateName`, or `managedClaimProvisionerName` must
+   be set per `resourceClaims[]` entry.
 2. **Feature gate:** `ManagedDRAClaims` must be enabled when
-   `managedClaimProvisioner` is used.
+   `managedClaimProvisionerName` is used.
 3. **Provisioner exists:** the referenced `ManagedClaimProvisioner`
    must exist at VMI creation time.
-4. **Immutability:** `managedClaimProvisioner.name` cannot be changed
+4. **Immutability:** `managedClaimProvisionerName` cannot be changed
    after VMI creation.
 5. **Device coverage:** at least one device declaration must reference
    each managed claim entry (no empty claims).
@@ -506,8 +496,7 @@ metadata:
 spec:
   resourceClaims:
   - name: my-gpu
-    managedClaimProvisioner:
-      name: gpu-default
+    managedClaimProvisionerName: gpu-default
   domain:
     devices:
       gpus:
@@ -569,8 +558,7 @@ metadata:
 spec:
   resourceClaims:
   - name: aligned-devices
-    managedClaimProvisioner:
-      name: pcie-aligned
+    managedClaimProvisionerName: pcie-aligned
   domain:
     devices:
       gpus:
@@ -644,8 +632,7 @@ metadata:
 spec:
   resourceClaims:
   - name: all-devices
-    managedClaimProvisioner:
-      name: hgx-b200-quarter
+    managedClaimProvisionerName: hgx-b200-quarter
   domain:
     cpu:
       cores: 16
@@ -803,7 +790,8 @@ scalability model. See
 ### Alpha
 
 - `ManagedClaimProvisioner` CRD (cluster-scoped)
-- `managedClaimProvisioner` field on `VirtualMachineInstanceResourceClaim`
+- `managedClaimProvisionerName` field on
+  `VirtualMachineInstanceResourceClaim`
 - Managed-claim framework and built-in topology provisioner
   (`policy.kubevirt.io/aligner`)
 - API changes behind `ManagedDRAClaims` feature gate (off by default)
