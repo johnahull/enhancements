@@ -57,7 +57,7 @@ declare their devices. The provisioner controller assembles the
 - Let users express topology-aligned multi-device claims without
   hand-authoring `ResourceClaim` objects
 - Separate admin concerns (DeviceClass selection, topology policy) from
-  user concerns (device declarations, counts) via the provisioner CRD
+  user concerns (device declarations) via the provisioner CRD
 - Support extensibility via pluggable provisioner controllers
 - Reuse existing device declaration patterns (`gpus[]`, `hostDevices[]`,
   `networks[]`, `cpu.dra`) as the source of truth for claim generation
@@ -87,8 +87,6 @@ declare their devices. The provisioner controller assembles the
   node with a single provisioner reference
 - As an admin, I want to define DeviceClass mappings and topology policy
   once and have all users reference them by name
-- As an admin, I want users to be able to override the default
-  DeviceClass when they need a specific one
 - As a developer, I want to implement a custom provisioner controller
   with my own claim generation logic
 
@@ -105,8 +103,7 @@ All changes are gated behind `ManagedDRAClaims` (alpha, off by default).
 ### Responsibility Boundary
 
 - **User owns:** device declarations (`gpus[]`, `hostDevices[]`,
-  `networks[]`, `cpu.dra`), device counts, optional `deviceClassName`
-  overrides
+  `networks[]`, `cpu.dra`)
 - **Admin owns:** `ManagedClaimProvisioner` objects (DeviceClass
   mappings, topology policy, provisioner controller selection)
 - **Provisioner controller owns:** `ResourceClaim` generation, constraint
@@ -122,8 +119,7 @@ VEP-152 and VEP-300 are developed concurrently:
   accounting formula, `CPUsWithDRA` feature gate, unified `dedicated` API
 - **VEP-300 owns:** `ManagedClaimProvisioner` CRD, `managedClaimProvisioner`
   field on `VirtualMachineInstanceResourceClaim`, provisioner controller,
-  `deviceClassName` on `GPU` and `HostDevice`, `ManagedDRAClaims` feature
-  gate
+  `ManagedDRAClaims` feature gate
 
 VEP-152's future `autoClaim` path for CPU-only claims is superseded by
 VEP-300's managed claims, which handle CPUs as part of cross-device claims.
@@ -235,59 +231,11 @@ type VirtualMachineInstanceResourceClaim struct {
 }
 ```
 
-#### Modified: `GPU`
+#### `GPU` and `HostDevice`
 
-Two new fields added by this VEP (`DeviceClassName` and `Count`):
-
-```go
-type GPU struct {
-	Name              string       `json:"name"`
-	DeviceName        string       `json:"deviceName,omitempty"`
-	*ClaimRequest     `json:",inline"`
-	VirtualGPUOptions *VGPUOptions `json:"virtualGPUOptions,omitempty"`
-	Tag               string       `json:"tag,omitempty"`
-
-	// DeviceClassName overrides the DeviceClass from the
-	// ManagedClaimProvisioner for this GPU. When omitted,
-	// the provisioner's gpus.deviceClassName is used.
-	// +optional
-	DeviceClassName string `json:"deviceClassName,omitempty"`
-
-	// Count specifies how many GPUs of this type to request.
-	// The controller expands this entry into Count individual
-	// entries named <name>-0 through <name>-<count-1>, each with
-	// requestName <requestName>-0 through <requestName>-<count-1>.
-	// Defaults to 1 when omitted.
-	// +optional
-	Count int `json:"count,omitempty"`
-}
-```
-
-#### Modified: `HostDevice`
-
-Two new fields added by this VEP (`DeviceClassName` and `Count`):
-
-```go
-type HostDevice struct {
-	Name          string `json:"name"`
-	DeviceName    string `json:"deviceName,omitempty"`
-	*ClaimRequest `json:",inline"`
-	Tag           string `json:"tag,omitempty"`
-
-	// DeviceClassName overrides the DeviceClass from the
-	// ManagedClaimProvisioner for this host device. When omitted,
-	// the provisioner's hostDevices.deviceClassName is used.
-	// +optional
-	DeviceClassName string `json:"deviceClassName,omitempty"`
-
-	// Count specifies how many host devices of this type to request.
-	// The controller expands this entry into Count individual
-	// entries named <name>-0 through <name>-<count-1>.
-	// Defaults to 1 when omitted.
-	// +optional
-	Count int `json:"count,omitempty"`
-}
-```
+No new fields added to `GPU` or `HostDevice` by this VEP. The existing
+structs are used as-is with their `ClaimRequest` fields (`claimName`,
+`requestName`).
 
 #### CPU (`CPUDRASource`, defined by VEP-152)
 
@@ -302,36 +250,23 @@ type CPU struct {
 	DRA *CPUDRASource `json:"dra,omitempty"`
 }
 
-// CPUDRASource as defined by VEP-152, with DeviceClassName added
-// by this VEP for managed claim support.
 type CPUDRASource struct {
 	// ClaimRequest references a specific request from a ResourceClaim
 	// listed in vmi.spec.resourceClaims[].
 	*ClaimRequest `json:",inline"`
-
-	// DeviceClassName overrides the provisioner's cpu.deviceClassName.
-	// Added by VEP-300 for managed claim support.
-	// +optional
-	DeviceClassName string `json:"deviceClassName,omitempty"`
 }
 ```
 
-When `DeviceClassName` is omitted, the provisioner's
-`cpu.deviceClassName` is used. VEP-300 scans `cpu.dra` during claim
-generation alongside the other device types. The CPU count in the
+VEP-300 scans `cpu.dra` during claim generation alongside the other
+device types. The DeviceClassName is resolved from the provisioner
+CRD's `cpu.deviceClassName` field. The CPU count in the
 generated claim is derived from VEP-152's accounting formula
 (`cores × sockets × threads + emulatorThreadCPUs + supplementalPoolThreadCount`).
 See [VEP-152 CPU accounting](../152-cpu-dra/vep.md) for details.
 
 ### DeviceClassName Resolution
 
-For each device referencing a managed claim, the controller resolves the
-DeviceClassName in this order:
-
-1. VMI device `deviceClassName` (user override, highest priority)
-2. Provisioner CRD device type section (admin default)
-3. Error if neither is set
-
+DeviceClass names are defined in the `ManagedClaimProvisioner` CRD.
 The controller determines device type by which VMI field the device
 appears in:
 
@@ -345,36 +280,33 @@ appears in:
 ```
 GenerateManagedClaim(vmi, claimEntry, provisioner) → ResourceClaim:
 
-  1. Expand device counts:
-     - For each GPU or HostDevice with count > 1, expand into
-       individual entries: name-0 through name-(count-1),
-       requestName-0 through requestName-(count-1). Each
-       inherits deviceClassName from the original entry.
-
-  2. Collect device requests:
-     a. Scan domain.devices.gpus[] (after expansion) — for each
-        GPU where claimName == claimEntry.Name, resolve
-        DeviceClassName (device → provisioner → error), create a
+  1. Collect device requests:
+     a. Scan domain.devices.gpus[] — for each GPU where
+        claimName == claimEntry.Name, look up DeviceClassName
+        from provisioner CRD gpus section, create a
         DeviceRequest with Name=requestName,
         DeviceClassName=resolved, Count=1.
-     b. Scan domain.devices.hostDevices[] — same pattern.
+     b. Scan domain.devices.hostDevices[] — same pattern,
+        using provisioner hostDevices section.
      c. Scan spec.networks[] — for each network where
-        resourceClaim.claimName == claimEntry.Name, resolve
-        DeviceClassName, create a DeviceRequest.
+        resourceClaim.claimName == claimEntry.Name, look up
+        DeviceClassName from provisioner networks section,
+        create a DeviceRequest.
      d. Scan domain.cpu.dra (VEP-152) — if claimName matches,
-        resolve DeviceClassName, create a DeviceRequest with
-        CPU count derived from VEP-152's accounting formula
+        look up DeviceClassName from provisioner cpu section,
+        create a DeviceRequest with CPU count derived from
+        VEP-152's accounting formula
         (cores × sockets × threads + emulator + IOThreads).
         The claim shape (capacity vs count) is determined by
         the DeviceClass and driver mode, not by the user.
 
-  3. Validate:
+  2. Validate:
      - At least one device must reference the claim.
-     - Every referencing device must have a resolved
-       DeviceClassName.
+     - Every device type must have a DeviceClassName in the
+       provisioner CRD.
      - No duplicate requestName values.
 
-  4. Build topology constraints from provisioner.spec.align:
+  3. Build topology constraints from provisioner.spec.align:
      - For each align entry, expand shorthands:
          numaNode → resource.kubernetes.io/numaNode
          pcieRoot → resource.kubernetes.io/pcieRoot
@@ -385,7 +317,7 @@ GenerateManagedClaim(vmi, claimEntry, provisioner) → ResourceClaim:
        (KEP-5491); the scheduler's set-intersection semantics
        handle list-vs-scalar matching transparently.
 
-  5. Assemble ResourceClaim:
+  4. Assemble ResourceClaim:
      - Name: <vmi-name>-<claim-name>
      - Namespace: vmi.Namespace
      - OwnerReference: VMI (controller=true, for GC)
@@ -589,14 +521,13 @@ The validating webhook enforces:
    after VMI creation.
 5. **Device coverage:** at least one device declaration must reference
    each managed claim entry (no empty claims).
-6. **DeviceClassName resolvable:** every device referencing a managed
-   claim must have a `deviceClassName` — either set on the device or
-   available in the provisioner CRD for that device type.
+6. **DeviceClassName available:** the provisioner CRD must have a
+   `deviceClassName` configured for every device type referenced by
+   devices in the managed claim.
 7. **Unique request names:** no duplicate `requestName` values within
    a managed claim.
 8. **Valid align entries:** each `align` value must be a known shorthand
    or a valid fully-qualified attribute name.
-9. **Valid count values:** `count` must be >= 1. Values <= 0 are rejected.
 
 ### Error Handling
 
@@ -797,10 +728,12 @@ spec:
         requestName: cpus
     devices:
       gpus:
-      - name: gpu
+      - name: gpu0
         claimName: all-devices
-        requestName: gpu
-        count: 2
+        requestName: gpu0
+      - name: gpu1
+        claimName: all-devices
+        requestName: gpu1
       interfaces:
       - name: rdma-nic
         sriov: {}
@@ -814,8 +747,7 @@ spec:
       requestName: nic
 ```
 
-The controller expands `count: 2` into `gpu-0` and `gpu-1`. Generated
-`ResourceClaim`:
+Generated `ResourceClaim`:
 
 ```yaml
 apiVersion: resource.k8s.io/v1
@@ -827,11 +759,11 @@ metadata:
 spec:
   devices:
     requests:
-    - name: gpu-0
+    - name: gpu0
       exactly:
         deviceClassName: gpu.nvidia.com
         count: 1
-    - name: gpu-1
+    - name: gpu1
       exactly:
         deviceClassName: gpu.nvidia.com
         count: 1
@@ -845,44 +777,15 @@ spec:
         count: 16
     constraints:
     - matchAttribute: resource.kubernetes.io/numaNode
-      requests: [gpu-0, gpu-1, nic, cpus]
+      requests: [gpu0, gpu1, nic, cpus]
     - matchAttribute: resource.kubernetes.io/pcieRoot
-      requests: [gpu-0, gpu-1, nic, cpus]
+      requests: [gpu0, gpu1, nic, cpus]
 ```
 
 The `pcieRoot` constraint works across all device types because the CPU
 DRA driver publishes `pcieRoot` as a list attribute (KEP-5491). The
 scheduler's set-intersection semantics match the CPU group's PCIe root
 list against the GPU and NIC scalar values.
-
-### DeviceClassName Override
-
-A user who needs AMD GPUs with an NVIDIA-default provisioner:
-
-```yaml
-apiVersion: kubevirt.io/v1
-kind: VirtualMachineInstance
-metadata:
-  name: amd-gpu-vm
-spec:
-  resourceClaims:
-  - name: my-gpu
-    managedClaimProvisioner:
-      name: pcie-aligned
-  domain:
-    devices:
-      gpus:
-      - name: gpu0
-        claimName: my-gpu
-        requestName: gpu
-        deviceClassName: gpu.amd.com
-    resources:
-      requests:
-        memory: 8Gi
-```
-
-The user's `deviceClassName: gpu.amd.com` overrides the provisioner's
-`gpus.deviceClassName: gpu.nvidia.com`.
 
 ## Alternatives
 
@@ -961,9 +864,8 @@ scalability model. See
 ## Functional Testing Approach
 
 - Unit tests for `GenerateManagedClaim`: single device, multi-device,
-  topology alignment, shorthand expansion, DeviceClassName override,
-  count expansion, error cases
-- Unit tests for validation: mutual exclusion, missing DeviceClassName,
+  topology alignment, shorthand expansion, error cases
+- Unit tests for validation: mutual exclusion, missing provisioner,
   invalid align values, empty claims, duplicate request names,
   provisioner existence
 - Integration tests with fake ManagedClaimProvisioner objects (envtest)
