@@ -247,7 +247,7 @@ VEP-300 scans `cpu.dra` during claim generation alongside the other
 device types. The DeviceClassName is resolved from the provisioner
 CRD's `cpu.deviceClassName` field. The CPU count in the
 generated claim is derived from VEP-152's accounting formula
-(`cores × sockets × threads + emulatorThreadCPUs + supplementalPoolThreadCount`).
+(`cores x sockets x threads + emulatorThreadCPUs + supplementalPoolThreadCount`).
 See [VEP-152 CPU accounting](../152-cpu-dra/vep.md) for details.
 
 ### DeviceClassName Resolution
@@ -256,33 +256,33 @@ DeviceClass names are defined in the `ManagedClaimProvisioner` CRD.
 The controller determines device type by which VMI field the device
 appears in:
 
-- `domain.devices.gpus[]` → provisioner `spec.gpus.deviceClassName`
-- `domain.devices.hostDevices[]` → provisioner `spec.hostDevices.deviceClassName`
-- `spec.networks[].resourceClaim` → provisioner `spec.networks.deviceClassName`
-- `domain.cpu.dra` → provisioner `spec.cpu.deviceClassName`
+- `domain.devices.gpus[]` -> provisioner `spec.gpus.deviceClassName`
+- `domain.devices.hostDevices[]` -> provisioner `spec.hostDevices.deviceClassName`
+- `spec.networks[].resourceClaim` -> provisioner `spec.networks.deviceClassName`
+- `domain.cpu.dra` -> provisioner `spec.cpu.deviceClassName`
 
 ### Claim Generation Algorithm
 
 ```
-GenerateClaim(managedClaimContext) → ResourceClaimSpec:
+GenerateClaim(managedClaimContext) -> ResourceClaimSpec:
 
   1. Collect device requests:
-     a. Scan domain.devices.gpus[] — for each GPU where
+     a. Scan domain.devices.gpus[] - for each GPU where
         claimName == claimEntry.Name, look up DeviceClassName
         from provisioner CRD gpus section, create a
         DeviceRequest with Name=requestName,
         DeviceClassName=resolved, Count=1.
-     b. Scan domain.devices.hostDevices[] — same pattern,
+     b. Scan domain.devices.hostDevices[] - same pattern,
         using provisioner hostDevices section.
-     c. Scan spec.networks[] — for each network where
+     c. Scan spec.networks[] - for each network where
         resourceClaim.claimName == claimEntry.Name, look up
         DeviceClassName from provisioner networks section,
         create a DeviceRequest.
-     d. Scan domain.cpu.dra (VEP-152) — if claimName matches,
+     d. Scan domain.cpu.dra (VEP-152) - if claimName matches,
         look up DeviceClassName from provisioner cpu section,
         create a DeviceRequest with CPU count derived from
         VEP-152's accounting formula
-        (cores × sockets × threads + emulator + IOThreads).
+        (cores x sockets x threads + emulator + IOThreads).
         The claim shape (capacity vs count) is determined by
         the DeviceClass and driver mode, not by the user.
 
