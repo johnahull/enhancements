@@ -21,11 +21,10 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 
 This proposal adds managed DRA claim generation to KubeVirt via a new
 `ManagedClaimProvisioner` CRD. Admins create provisioner objects that
-encode DeviceClass names, topology alignment policy, and the name of
-the controller responsible for claim generation. Users reference a
-provisioner by name in the VMI spec and declare their devices as they
-do today. The provisioner controller generates the `ResourceClaim`
-automatically.
+encode DeviceClass names and the name of the provisioner controller.
+Users reference a provisioner by name in the VMI spec and declare their
+devices as they do today. The managed-claim framework invokes the
+provisioner to generate the `ResourceClaim` automatically.
 
 The design extends the approach sketched in
 [VEP-10 Appendix C](../10-dra-devices/vep.md#c-managed-resource-claims)
@@ -47,17 +46,19 @@ The VMI spec already says "I have a GPU and a NIC." The topology intent
 ("put them on the same PCIe root") should not require re-expressing that
 in a separate Kubernetes object.
 
-A `ManagedClaimProvisioner` closes this gap: the admin encodes the
-infrastructure details once, and users express only their device intent.
-The mechanics are described in the Design section.
+With a `ManagedClaimProvisioner`, the admin selects the provisioner and
+provides DeviceClass mappings. Users reference the provisioner by name
+and declare their devices. The provisioner receives all device
+declarations for the managed claim and assembles the `ResourceClaim`.
 
 ## Goals
 
 - Let users express topology-aligned multi-device claims without
   hand-authoring `ResourceClaim` objects
-- Separate admin concerns (DeviceClass selection, topology policy) from
-  user concerns (device declarations) via the provisioner CRD
-- Support extensibility via pluggable provisioner controllers
+- Separate admin concerns (provisioner selection and DeviceClass
+  mappings) from user concerns (device declarations) via the
+  provisioner CRD
+- Support extensibility via independent provisioner controllers
 - Reuse existing device declaration patterns (`gpus[]`, `hostDevices[]`,
   `networks[]`, `cpu.dra`) as the source of truth for claim generation
 
@@ -71,8 +72,7 @@ The mechanics are described in the Design section.
 
 ## Definition of Users
 
-- **User:** a person who wants DRA devices in a VM without writing
-  ResourceClaim YAML
+- **User:** a person who wants DRA devices in a VM.
 - **Admin:** a person who deploys DRA drivers, creates DeviceClass
   resources, and creates `ManagedClaimProvisioner` objects
 - **Developer:** a person building custom provisioner controllers or
@@ -84,9 +84,9 @@ The mechanics are described in the Design section.
   root without learning DRA claim syntax or knowing DeviceClass names
 - As a user, I want to request GPUs, NICs, and CPUs on the same NUMA
   node with a single provisioner reference
-- As an admin, I want to define DeviceClass mappings and topology policy
-  once and have all users reference them by name
-- As a developer, I want to implement a custom provisioner controller
+- As an admin, I want to define DeviceClass mappings once and have all
+  users reference them by name
+- As a developer, I want to implement a custom provisioner
   with my own claim generation logic
 
 ## Repos
@@ -104,9 +104,13 @@ All changes are gated behind `ManagedDRAClaims` (alpha, off by default).
 - **User owns:** device declarations (`gpus[]`, `hostDevices[]`,
   `networks[]`, `cpu.dra`)
 - **Admin owns:** `ManagedClaimProvisioner` objects (DeviceClass
-  mappings, topology policy, provisioner controller selection)
-- **Provisioner controller owns:** `ResourceClaim` generation, constraint
-  assembly, claim lifecycle (creation, GC via owner references)
+  mappings and provisioner controller selection)
+- **Managed-claim framework owns:** provisioner-controller watches,
+  reconciliation helpers, and ResourceClaim lifecycle
+- **Virt-controller owns:** rendering managed claim references into the
+  launcher pod
+- **Claim provisioner owns:** desired ResourceClaim device requests and
+  constraints for one managed claim
 - **Scheduler owns:** device allocation, topology constraint satisfaction
 
 ### Scope Boundary with VEP-152
@@ -116,19 +120,13 @@ VEP-152 and VEP-300 are developed concurrently:
 - **VEP-152 owns:** `cpu.dra` struct (`CPUDRASource`), `deviceClassName`
   on `CPUDRASource`, CPU consumption (virt-launcher vCPU pinning), CPU
   accounting formula, `CPUsWithDRA` feature gate, unified `dedicated` API
-- **VEP-300 owns:** `ManagedClaimProvisioner` CRD, `managedClaimProvisioner`
-  field on `VirtualMachineInstanceResourceClaim`, provisioner controller,
-  `ManagedDRAClaims` feature gate
+- **VEP-300 owns:** `ManagedClaimProvisioner` CRD,
+  `managedClaimProvisionerName` field on
+  `VirtualMachineInstanceResourceClaim`, the managed-claim provisioning
+  framework, and the `ManagedDRAClaims` feature gate
 
 VEP-152's future `autoClaim` path for CPU-only claims is superseded by
 VEP-300's managed claims, which handle CPUs as part of cross-device claims.
-
-### Scope Boundary with VEP-183
-
-`spec.networks[].resourceClaim` (the network device declaration) is owned
-by VEP-183, which defines it as a `ClaimRequest` (`claimName`,
-`requestName`, no `deviceClassName`). VEP-300 reads it as a claim source
-during generation but does not define it.
 
 ### External Dependencies
 
@@ -149,8 +147,8 @@ during generation but does not define it.
 
 #### New CRD: `ManagedClaimProvisioner`
 
-A cluster-scoped resource that encodes DeviceClass mappings, topology
-alignment policy, and the provisioner controller name:
+A cluster-scoped resource that encodes DeviceClass mappings and the
+provisioner controller name:
 
 ```yaml
 apiVersion: kubevirt.io/v1alpha1
@@ -158,53 +156,74 @@ kind: ManagedClaimProvisioner
 metadata:
   name: pcie-aligned
 spec:
-  # Names the controller that generates the ResourceClaim.
-  # Built-in controller: policy.kubevirt.io/aligner
-  # External controllers use their own provisioner name.
+  # Identifies the controller responsible for claim generation.
+  # Built-in: policy.kubevirt.io/aligner
+  # Third-party controllers use their own name.
   provisioner: policy.kubevirt.io/aligner
 
-  # Topology alignment policy for the built-in controller.
-  # Values are shorthands (numaNode, pcieRoot) or fully-qualified
-  # attribute names (see Shorthand Expansion).
-  # +optional
-  align: [pcieRoot]
-
-  # DeviceClass mappings per device type.
-  # One DeviceClass per type for Alpha.
-  # +optional
-  cpu:
+  # DeviceClass mappings and optional DRA configuration.
+  # Each name is one of cpu, gpu, hostDevice, or network.
+  deviceTypes:
+  - name: cpu
     deviceClassName: cpu.dra.k8s.io
-  # +optional
-  gpus:
-    deviceClassName: gpu.nvidia.com
-  # +optional
-  hostDevices:
+  - name: gpu
+    deviceClassName: gpu.example.com
+    opaque:
+      driver: gpu.example.com
+      parameters:
+        apiVersion: gpu.example.com/v1alpha1
+        kind: GPUConfig
+        iommu:
+          backendPolicy: LegacyOnly
+          enableAPIDevice: true
+  - name: hostDevice
     deviceClassName: pci.example.com
-  # +optional
-  networks:
-    deviceClassName: sriov.mellanox.com
-
-  # Opaque parameters passed to external provisioner controllers.
-  # +optional
-  parameters:
-    customKey: customValue
+  - name: network
+    deviceClassName: sriov.example.com
 ```
 
-#### New Type: `ManagedClaimProvisionerRef`
+The provisioner receives the managed claim entry and every VMI device
+that references it. The provisioner chooses the generated
+`ResourceClaim.spec.devices.constraints`, including any upstream
+[`DeviceConstraint`](https://kubernetes.io/docs/reference/kubernetes-api/resource/resource-claim-v1/#DeviceConstraint)
+objects. KubeVirt does not expose provisioner-specific constraint or
+pairing policy in `ManagedClaimProvisioner.spec`.
+
+`deviceTypes` is a named list. The name maps VMI device declarations to
+the provisioner configuration: `cpu` maps to `domain.cpu.dra`, `gpu` to
+`domain.devices.gpus[]`, `hostDevice` to `domain.devices.hostDevices[]`,
+and `network` to `spec.networks[].resourceClaim`.
+
+`opaque` is optional driver-specific configuration. When present, the
+provisioner renders a Kubernetes `DeviceClaimConfiguration` in
+`ResourceClaim.spec.devices.config`, with `requests` set to every
+generated request for that device type and `opaque` copied from the
+provisioner. This follows the ResourceClaim configuration model used
+for KubeVirt GPU DRA claims.
 
 ```go
-// ManagedClaimProvisionerRef references a ManagedClaimProvisioner
-// object by name.
-type ManagedClaimProvisionerRef struct {
-	// Name is the name of the ManagedClaimProvisioner object.
-	// This field is immutable after creation.
-	Name string `json:"name"`
+type ManagedClaimProvisionerSpec struct {
+	Provisioner string `json:"provisioner"`
+
+	// +listType=map
+	// +listMapKey=name
+	DeviceTypes []ManagedClaimDeviceType `json:"deviceTypes"`
+}
+
+type ManagedClaimDeviceType struct {
+	Name            string `json:"name"`
+	DeviceClassName string `json:"deviceClassName"`
+	Opaque          *resourcev1.OpaqueDeviceConfiguration `json:"opaque,omitempty"`
 }
 ```
 
+The YAML fields map directly to this spec: `provisioner` identifies the
+controller, and each `deviceTypes[]` entry maps to
+`ManagedClaimDeviceType`.
+
 #### Modified: `VirtualMachineInstanceResourceClaim`
 
-Add `ManagedClaimProvisioner` as a third mutually-exclusive option:
+Add `ManagedClaimProvisionerName` as a third mutually-exclusive option:
 
 ```go
 type VirtualMachineInstanceResourceClaim struct {
@@ -214,21 +233,24 @@ type VirtualMachineInstanceResourceClaim struct {
 	// ResourceClaimName is the name of a ResourceClaim object in the
 	// same namespace as this VMI.
 	// Exactly one of ResourceClaimName, ResourceClaimTemplateName, or
-	// ManagedClaimProvisioner must be set.
+	// ManagedClaimProvisionerName must be set.
 	ResourceClaimName *string `json:"resourceClaimName,omitempty"`
 
 	// ResourceClaimTemplateName is the name of a ResourceClaimTemplate
 	// object in the same namespace as this VMI.
 	// Exactly one of ResourceClaimName, ResourceClaimTemplateName, or
-	// ManagedClaimProvisioner must be set.
+	// ManagedClaimProvisionerName must be set.
 	ResourceClaimTemplateName *string `json:"resourceClaimTemplateName,omitempty"`
 
-	// ManagedClaimProvisioner references a ManagedClaimProvisioner
-	// object that controls how the ResourceClaim is generated.
+	// ManagedClaimProvisionerName references a cluster-scoped
+	// ManagedClaimProvisioner object that controls how the
+	// ResourceClaim is generated.
+	// The managed-claim framework passes VMI device declarations to
+	// the matching provisioner controller, which generates a ResourceClaim.
 	// Exactly one of ResourceClaimName, ResourceClaimTemplateName, or
-	// ManagedClaimProvisioner must be set.
+	// ManagedClaimProvisionerName must be set.
 	// +optional
-	ManagedClaimProvisioner *ManagedClaimProvisionerRef `json:"managedClaimProvisioner,omitempty"`
+	ManagedClaimProvisionerName *string `json:"managedClaimProvisionerName,omitempty"`
 }
 ```
 
@@ -260,10 +282,10 @@ type CPUDRASource struct {
 
 VEP-300 scans `cpu.dra` during claim generation alongside the other
 device types. The DeviceClassName is resolved from the provisioner
-CRD's `cpu.deviceClassName` field. The CPU count in the generated claim
-is derived from VEP-152's accounting formula; VEP-152 is the single
-source of truth for that formula. See
-[VEP-152 (PR #414)](https://github.com/kubevirt/enhancements/pull/414).
+CRD's `cpu.deviceClassName` field. The CPU count in the
+generated claim is derived from VEP-152's accounting formula
+(`cores x sockets x threads + emulatorThreadCPUs + supplementalPoolThreadCount`).
+See [VEP-152 CPU accounting](../152-cpu-dra/vep.md) for details.
 
 ### DeviceClassName Resolution
 
@@ -271,191 +293,158 @@ DeviceClass names are defined in the `ManagedClaimProvisioner` CRD.
 The controller determines device type by which VMI field the device
 appears in:
 
-- `domain.devices.gpus[]` → provisioner `spec.gpus.deviceClassName`
-- `domain.devices.hostDevices[]` → provisioner `spec.hostDevices.deviceClassName`
-- `spec.networks[].resourceClaim` → provisioner `spec.networks.deviceClassName`
-- `domain.cpu.dra` → provisioner `spec.cpu.deviceClassName`
+- `domain.devices.gpus[]` -> `deviceTypes[name=gpu]`
+- `domain.devices.hostDevices[]` -> `deviceTypes[name=hostDevice]`
+- `spec.networks[].resourceClaim` -> `deviceTypes[name=network]`
+- `domain.cpu.dra` -> `deviceTypes[name=cpu]`
 
 ### Claim Generation Algorithm
 
 ```
-GenerateManagedClaim(vmi, claimEntry, provisioner) → ResourceClaim:
+GenerateClaim(managedClaimContext) -> ResourceClaimSpec:
 
-  1. Collect device requests. For each device type, resolve the
-     DeviceClassName per the DeviceClassName Resolution section and
-     emit a DeviceRequest named after requestName:
-     a. gpus[] where claimName == claimEntry.Name (Count=1).
-     b. hostDevices[] where claimName == claimEntry.Name (Count=1).
-     c. networks[] where resourceClaim.claimName == claimEntry.Name.
-     d. cpu.dra (VEP-152) if claimName == claimEntry.Name. The CPU
-        count comes from VEP-152's accounting formula. The claim shape
-        (capacity vs count) is determined by the DeviceClass and driver
-        mode, not by the user.
+  1. Collect device requests:
+     a. Scan domain.devices.gpus[] - for each GPU where
+        claimName == claimEntry.Name, look up DeviceClassName
+        from deviceTypes[name=gpu], create a
+        DeviceRequest with Name=requestName,
+        DeviceClassName=resolved, Count=1.
+     b. Scan domain.devices.hostDevices[] - same pattern,
+        using deviceTypes[name=hostDevice].
+     c. Scan spec.networks[] - for each network where
+        resourceClaim.claimName == claimEntry.Name, look up
+        DeviceClassName from deviceTypes[name=network],
+        create a DeviceRequest.
+     d. Scan domain.cpu.dra (VEP-152) - if claimName matches,
+        look up DeviceClassName from deviceTypes[name=cpu],
+        create a DeviceRequest with CPU count derived from
+        VEP-152's accounting formula
+        (cores x sockets x threads + emulator + IOThreads).
+        The claim shape (capacity vs count) is determined by
+        the DeviceClass and driver mode, not by the user.
 
-  2. Validate the collected requests. The full rules are enforced at
-     admission (see the Validation section) and re-checked here.
+  2. Validate:
+     - At least one device must reference the claim.
+     - Every device type must have a DeviceClassName in the
+       provisioner CRD.
+     - No duplicate requestName values.
 
-  3. Build topology constraints from provisioner.spec.align. Expand
-     each align value per the Shorthand Expansion section, then create
-     one matchAttribute constraint per align value spanning all request
-     names collected in step 1. Cross-device pcieRoot matching relies
-     on KEP-5491 set intersection (see External Dependencies).
+  3. For each configured device type with opaque configuration, add a
+     DeviceClaimConfiguration with the generated request names for that
+     type and the configured opaque value.
 
-  4. Assemble the ResourceClaim:
-     Name: <vmi-name>-<claim-name>
-     Namespace: vmi.Namespace
-     OwnerReference: VMI (controller=true, for GC)
-     Labels: kubevirt.io/managed-claim: <claim-name>
-     Spec.Devices.Requests: collected requests
-     Spec.Devices.Constraints: collected constraints
+  4. The provisioner builds spec.devices.constraints from the full set
+     of collected requests. The built-in provisioner applies its
+     PCIe-root and NUMA topology policy. Other provisioner controllers
+     define their own constraint-generation behavior.
+
+  5. Assemble ResourceClaim:
+     - Name: <vmi-name>-<claim-name>
+     - Namespace: vmi.Namespace
+     - OwnerReference: VMI (controller=true, for GC)
+     - Labels: kubevirt.io/managed-claim: <claim-name>
+     - Spec.Devices.Requests: collected requests
+     - Spec.Devices.Config: generated device configurations
+     - Spec.Devices.Constraints: collected constraints
 ```
 
-### Where Generation Happens
+### Managed-Claim Provisioning Framework
 
-Claim generation runs in **virt-controller** as a reconciliation loop.
-The VMI is persisted with `managedClaimProvisioner` in the spec. The
-controller creates ResourceClaims asynchronously, tracks them via
-expectations, and waits for readiness before proceeding with pod
-creation. This follows the same pattern KubeVirt uses for backend
-storage PVCs (`pkg/storage/backend-storage/backend-storage.go`).
+The managed-claim framework is a reusable controller library. A
+provisioner controller uses it to watch matching VMIs and
+`ManagedClaimProvisioner` objects, collect the claim's devices, and
+create or update the generated `ResourceClaim`.
 
-**VMI sync flow integration:**
-
-Managed claim handling is inserted into the VMI sync loop
-(`pkg/virt-controller/watch/vmi/lifecycle.go`) after topology hints
-and before backend storage:
-
-```
-sync() → check deletionTimestamp → check dataVolumes →
-  check topologyHints → handleManagedClaims() →
-  wait claimExpectations → wait managedClaimsReady →
-  handleBackendStorage() → wait backendStorageReady →
-  RenderLaunchManifest() → createPod()
-```
-
-For each `spec.resourceClaims[]` entry with
-`managedClaimProvisioner != nil`:
-
-1. Read the referenced `ManagedClaimProvisioner` object.
-2. If `provisioner` matches the built-in controller
-   (`policy.kubevirt.io/aligner`):
-   a. Call `GenerateManagedClaim` to build the `ResourceClaim`.
-   b. Create the `ResourceClaim` in the API server with
-      ownerReference to the VMI.
-   c. Record the generated claim name in VMI status.
-3. If `provisioner` names an external controller, virt-controller does
-   not generate the claim. It watches for the externally created
-   ResourceClaim instead, per the External Controller Contract section.
-4. Once all managed claims are resolved (status shows all claims in the
-   `Created` phase), proceed with pod creation.
-
-### Status Tracking
-
-A new `ManagedClaims` field on `VirtualMachineInstanceStatus` tracks
-the lifecycle of each managed claim:
+KubeVirt ships a separate topology-aligner controller for
+`policy.kubevirt.io/aligner`. A third party can install a separate
+controller for its own provisioner name. Provisioner controllers are
+not registered in virt-controller and do not need to be compiled into
+KubeVirt.
 
 ```go
-type VirtualMachineInstanceStatus struct {
-	// ... existing fields ...
-
-	// ManagedClaims tracks the status of managed ResourceClaim
-	// generation for each spec.resourceClaims[] entry that uses
-	// managedClaimProvisioner.
-	// +optional
-	// +listType=map
-	// +listMapKey=name
-	ManagedClaims []ManagedClaimStatus `json:"managedClaims,omitempty"`
+type ClaimProvisioner interface {
+	GenerateClaim(ctx *ManagedClaimContext) (*resourcev1.ResourceClaimSpec, error)
 }
 
-type ManagedClaimStatus struct {
-	// Name matches the spec.resourceClaims[].name entry.
-	Name string `json:"name"`
-
-	// ResourceClaimName is the name of the generated ResourceClaim.
-	ResourceClaimName string `json:"resourceClaimName,omitempty"`
-
-	// ProvisionerName identifies which provisioner created the claim.
-	ProvisionerName string `json:"provisionerName,omitempty"`
-
-	// Phase indicates the current lifecycle phase.
-	Phase ManagedClaimPhase `json:"phase"`
-
-	// Message provides human-readable details about the current phase.
-	// +optional
-	Message string `json:"message,omitempty"`
+type ManagedClaimContext struct {
+	VMI         *v1.VirtualMachineInstance
+	Claim       *v1.VirtualMachineInstanceResourceClaim
+	Provisioner *v1alpha1.ManagedClaimProvisioner
+	Devices     ManagedClaimDevices
 }
 
-type ManagedClaimPhase string
+type ManagedClaimDevices struct {
+	GPUs        []v1.GPU
+	HostDevices []v1.HostDevice
+	Networks    []ManagedClaimNetwork
+	CPU         *v1.CPUDRASource
+}
 
-const (
-	// ManagedClaimPending indicates the claim has not been created yet.
-	ManagedClaimPending ManagedClaimPhase = "Pending"
-	// ManagedClaimCreated indicates the ResourceClaim exists.
-	ManagedClaimCreated ManagedClaimPhase = "Created"
-	// ManagedClaimFailed indicates claim creation failed.
-	ManagedClaimFailed  ManagedClaimPhase = "Failed"
+type ManagedClaimNetwork struct {
+	Network   v1.Network
+	Interface *v1.Interface
+}
+```
+
+`Devices` contains every declaration in the VMI that references
+`Claim.Name`; it is not limited to a single device request. This lets a
+provisioner choose its own request grouping and generate one or more
+upstream `DeviceConstraint` objects without exposing that grouping in
+the VMI or `ManagedClaimProvisioner` API.
+
+The framework is initialized with the provisioner name that its
+controller serves. The built-in topology-aligner controller uses:
+
+```go
+managedclaim.NewController(
+    "policy.kubevirt.io/aligner",
+    &TopologyAlignerProvisioner{},
 )
 ```
 
-The controller checks readiness before proceeding with pod creation:
-all managed claims must be in the `Created` phase and the corresponding
-ResourceClaim must exist with an ownerReference to the VMI.
+For each `spec.resourceClaims[]` entry with
+`managedClaimProvisionerName != nil` whose referenced
+`ManagedClaimProvisioner.spec.provisioner` matches its configured name,
+the provisioner controller:
 
-### Expectations Pattern
+1. Collects all VMI device declarations whose `claimName` matches the
+   managed claim entry and constructs `ManagedClaimContext`.
+2. Calls `GenerateClaim`.
+3. Sets the deterministic claim name, namespace, labels, and VMI owner
+   reference on the returned desired object.
+4. Creates or updates the `ResourceClaim` and retries reconciliation on
+   errors or observed changes.
 
-The controller uses `UIDTrackingControllerExpectations` (the same
-mechanism used for pod and PVC creation) to avoid reconciling before
-the informer cache reflects newly created ResourceClaims:
+The generated claim has labels that identify the managed claim entry
+and provisioner:
 
-- `claimExpectations.ExpectCreations(vmiKey, count)` before creating
-  claims
-- `claimExpectations.CreationObserved(vmiKey)` when the ResourceClaim
-  informer sees the new object
-- `claimExpectations.SatisfiedExpectations(vmiKey)` checked in the
-  sync loop before proceeding
+```yaml
+metadata:
+  labels:
+    kubevirt.io/managed-claim: <claim-entry-name>
+    kubevirt.io/managed-claim-provisioner: <provisioner-name>
+```
 
-A ResourceClaim informer is added to the VMI controller, with event
-handlers that observe creation expectations and enqueue the owning VMI
-for reconciliation.
+Virt-controller does not invoke `GenerateClaim` and does not create or
+update managed claims. It derives the same deterministic claim name and
+renders it into the launcher pod's `resourceClaims` entry. Pod creation
+and ResourceClaim reconciliation proceed independently.
 
-### External Controller Contract
+```
+sync() -> check deletionTimestamp -> check dataVolumes ->
+  check topologyHints -> handleBackendStorage() ->
+  wait backendStorageReady ->
+  RenderLaunchManifest() -> createPod()
+```
 
-When the provisioner's `provisioner` field does not match the built-in
-controller, an external controller is responsible for creating the
-ResourceClaim. This follows the CSI provisioner pattern: the external
-controller creates the resource, and virt-controller observes it and
-updates VMI status. Only virt-controller writes VMI status.
+The scheduler and DRA allocation wait until the referenced ResourceClaim
+exists and becomes allocatable.
 
-**What the external controller must do:**
+### Provisioner Expectations
 
-1. Watch for VMIs where the referenced `ManagedClaimProvisioner` has a
-   `provisioner` field matching its name
-2. Create a `ResourceClaim` in the VMI's namespace
-3. Set `ownerReference` on the claim pointing to the VMI with
-   `controller: true` (required for GC)
-
-The external controller does not write VMI status. It only creates the
-ResourceClaim.
-
-**What virt-controller does for external claims:**
-
-1. Skips claim generation for entries where `provisioner` does not
-   match the built-in controller
-2. Watches for ResourceClaims owned by the VMI via the ResourceClaim
-   informer
-3. When a matching ResourceClaim appears, validates ownership and
-   updates VMI `status.managedClaims[]` to phase `Created`
-4. Proceeds with pod creation once all managed claims are resolved
-
-**Timeout:** if an external controller does not create the claim within
-5 minutes, virt-controller emits a `ManagedClaimTimeout` event on the
-VMI explaining which provisioner has not responded. The VMI stays in a
-pending state. It is not rejected, since the controller may start later.
-
-**Conflict avoidance:** the built-in controller only processes claims
-where `provisioner` matches `policy.kubevirt.io/aligner`. External
-controllers must only process claims matching their own provisioner
-name.
+Each provisioner controller uses expectations to avoid reconciling
+before its ResourceClaim informer cache reflects a create or update.
+The framework provides this common behavior to provisioner controllers.
 
 ### Implementation Details
 
@@ -464,77 +453,70 @@ name.
 limit, the name is truncated and a short hash suffix is appended to
 preserve uniqueness.
 
-**Idempotency:** controller reconciliation is naturally idempotent. If
-the ResourceClaim already exists with the correct ownerReference, the
-controller skips creation and updates status to `Created`.
+**Idempotency:** provisioner reconciliation is naturally idempotent. If
+the ResourceClaim already exists with the correct owner reference, the
+framework converges it to the provisioner's desired spec.
 
-**RBAC:** virt-controller's ClusterRole is updated to grant `create`,
-`get`, `list`, and `watch` permissions on `resourceclaims` in the
-`resource.k8s.io` API group. Deletion of generated claims is handled by
-owner-reference garbage collection, so `delete` is not required.
-virt-controller already has broad permissions for pod and PVC management.
+**RBAC:** the built-in provisioner controller needs `create`, `get`,
+`list`, `watch`, `update`, and `delete` permissions on `resourceclaims`
+in the `resource.k8s.io` API group, plus `patch` permission on
+`virtualmachineinstances/status`. Third-party provisioner controllers
+need equivalent permissions in their own RBAC configuration.
 
 **Multiple managed claims per VMI:** a VMI can have multiple
 `resourceClaims[]` entries, each independently using
-`managedClaimProvisioner`, `resourceClaimName`, or
+`managedClaimProvisionerName`, `resourceClaimName`, or
 `resourceClaimTemplateName`. Each managed claim entry is reconciled
-independently. Pod creation waits for all of them.
-
-### Shorthand Expansion
-
-| Shorthand  | Fully-Qualified Attribute                 |
-| ---------- | ----------------------------------------- |
-| `numaNode` | `resource.kubernetes.io/numaNode`         |
-| `pcieRoot` | `resource.kubernetes.io/pcieRoot`         |
-
-Fully-qualified names are passed through unchanged, enabling
-forward-compatibility with future topology attributes.
+independently. The pod can be created while claims are reconciling; DRA
+allocation waits for the corresponding claims.
 
 ### Validation
 
 The validating webhook enforces:
 
 1. **Mutual exclusion:** exactly one of `resourceClaimName`,
-   `resourceClaimTemplateName`, or `managedClaimProvisioner` must be
-   set per `resourceClaims[]` entry.
+   `resourceClaimTemplateName`, or `managedClaimProvisionerName` must
+   be set per `resourceClaims[]` entry.
 2. **Feature gate:** `ManagedDRAClaims` must be enabled when
-   `managedClaimProvisioner` is used.
+   `managedClaimProvisionerName` is used.
 3. **Provisioner exists:** the referenced `ManagedClaimProvisioner`
    must exist at VMI creation time.
-4. **Immutability:** `managedClaimProvisioner.name` cannot be changed
+4. **Immutability:** `managedClaimProvisionerName` cannot be changed
    after VMI creation.
 5. **Device coverage:** at least one device declaration must reference
    each managed claim entry (no empty claims).
-6. **DeviceClassName available:** the provisioner CRD must have a
-   `deviceClassName` configured for every device type referenced by
-   devices in the managed claim.
+6. **Device type configuration:** `deviceTypes[].name` must be unique
+   and one of `cpu`, `gpu`, `hostDevice`, or `network`. Every device type
+   referenced by devices in the managed claim must have a non-empty
+   `deviceClassName`. When `opaque` is set, its `driver` must be set.
 7. **Unique request names:** no duplicate `requestName` values within
    a managed claim.
-8. **Valid align entries:** each `align` value must be a known shorthand
-   or a valid fully-qualified attribute name.
-
 ### Error Handling
 
-**Claim generation failure:** if the built-in controller cannot generate
-a claim (e.g., no DeviceClassName resolvable, no devices reference the
-claim), it sets the status phase to `Failed` with a descriptive message
-and emits a `FailedCreateResourceClaim` event on the VMI. The VMI stays
-pending; the controller retries on the next reconciliation.
+Provisioner controllers report their own failures through the existing
+VMI status conditions list. The condition type
+`ManagedClaimProvisioningFailed` includes the managed claim entry and
+provisioner name in its reason and message; it is diagnostic only and
+is not a pod-creation readiness handshake.
+
+**Claim generation failure:** if a provisioner controller cannot
+generate a claim (for example, no DeviceClassName is resolvable), it
+sets a `ManagedClaimProvisioningFailed` condition on the VMI. The
+condition reason is `FailedCreateResourceClaim`; its message identifies
+the managed claim entry, provisioner name, and error. The controller
+also emits a `FailedCreateResourceClaim` event and retries on the next
+reconciliation. It clears the condition after successfully reconciling
+the claim. The launcher pod remains pending until the claim exists and
+can be allocated.
 
 **ResourceClaim deleted externally:** if a managed claim's ResourceClaim
-is deleted while the VMI is running, the controller detects this via the
-informer and re-creates the claim (built-in controller) or emits a
-warning event (external controller).
+is deleted while the VMI is running, its provisioner controller detects
+this through the informer and re-creates it on the next reconciliation.
 
-**External controller timeout:** see the External Controller Contract
-section for the 5-minute timeout behavior.
-
-**Provisioner deleted or modified after VMI creation:** the provisioner
-is validated at admission, but it is cluster-scoped and mutable. If the
-controller cannot read the referenced provisioner at generation time
-(deleted) or a required `deviceClassName` is missing (edited), it sets
-the status phase to `Failed`, emits a `FailedCreateResourceClaim` event,
-and retries. The VMI stays pending.
+**No provisioner controller:** if no controller serves the configured
+provisioner name, no matching ResourceClaim appears and the launcher pod
+remains pending. KubeVirt cannot distinguish this from a provisioner
+controller that is temporarily unavailable.
 
 **VMI deletion during claim creation:** the controller checks
 `vmi.DeletionTimestamp` before creating claims. If the VMI is being
@@ -554,8 +536,17 @@ metadata:
   name: gpu-default
 spec:
   provisioner: policy.kubevirt.io/aligner
-  gpus:
-    deviceClassName: gpu.nvidia.com
+  deviceTypes:
+  - name: gpu
+    deviceClassName: gpu.example.com
+    opaque:
+      driver: gpu.example.com
+      parameters:
+        apiVersion: gpu.example.com/v1alpha1
+        kind: GPUConfig
+        iommu:
+          backendPolicy: LegacyOnly
+          enableAPIDevice: true
 ```
 
 User creates VMI:
@@ -568,8 +559,7 @@ metadata:
 spec:
   resourceClaims:
   - name: my-gpu
-    managedClaimProvisioner:
-      name: gpu-default
+    managedClaimProvisionerName: gpu-default
   domain:
     devices:
       gpus:
@@ -600,8 +590,18 @@ spec:
     requests:
     - name: gpu
       exactly:
-        deviceClassName: gpu.nvidia.com
+        deviceClassName: gpu.example.com
         count: 1
+    config:
+    - requests: [gpu]
+      opaque:
+        driver: gpu.example.com
+        parameters:
+          apiVersion: gpu.example.com/v1alpha1
+          kind: GPUConfig
+          iommu:
+            backendPolicy: LegacyOnly
+            enableAPIDevice: true
 ```
 
 ### GPU + NIC Co-Placed on PCIe Root
@@ -615,11 +615,11 @@ metadata:
   name: pcie-aligned
 spec:
   provisioner: policy.kubevirt.io/aligner
-  align: [pcieRoot]
-  gpus:
-    deviceClassName: gpu.nvidia.com
-  networks:
-    deviceClassName: sriov.mellanox.com
+  deviceTypes:
+  - name: gpu
+    deviceClassName: gpu.example.com
+  - name: network
+    deviceClassName: sriov.example.com
 ```
 
 User creates VMI:
@@ -632,8 +632,7 @@ metadata:
 spec:
   resourceClaims:
   - name: aligned-devices
-    managedClaimProvisioner:
-      name: pcie-aligned
+    managedClaimProvisionerName: pcie-aligned
   domain:
     devices:
       gpus:
@@ -667,11 +666,11 @@ spec:
     requests:
     - name: gpu
       exactly:
-        deviceClassName: gpu.nvidia.com
+        deviceClassName: gpu.example.com
         count: 1
     - name: nic
       exactly:
-        deviceClassName: sriov.mellanox.com
+        deviceClassName: sriov.example.com
         count: 1
     constraints:
     - matchAttribute: resource.kubernetes.io/pcieRoot
@@ -689,13 +688,13 @@ metadata:
   name: hgx-b200-quarter
 spec:
   provisioner: policy.kubevirt.io/aligner
-  align: [numaNode, pcieRoot]
-  cpu:
+  deviceTypes:
+  - name: cpu
     deviceClassName: cpu.dra.k8s.io
-  gpus:
-    deviceClassName: gpu.nvidia.com
-  networks:
-    deviceClassName: sriov.mellanox.com
+  - name: gpu
+    deviceClassName: gpu.example.com
+  - name: network
+    deviceClassName: sriov.example.com
 ```
 
 User creates VMI:
@@ -708,8 +707,7 @@ metadata:
 spec:
   resourceClaims:
   - name: all-devices
-    managedClaimProvisioner:
-      name: hgx-b200-quarter
+    managedClaimProvisionerName: hgx-b200-quarter
   domain:
     cpu:
       cores: 16
@@ -751,35 +749,32 @@ spec:
     requests:
     - name: gpu0
       exactly:
-        deviceClassName: gpu.nvidia.com
+        deviceClassName: gpu.example.com
         count: 1
     - name: gpu1
       exactly:
-        deviceClassName: gpu.nvidia.com
+        deviceClassName: gpu.example.com
         count: 1
     - name: nic
       exactly:
-        deviceClassName: sriov.mellanox.com
+        deviceClassName: sriov.example.com
         count: 1
     - name: cpus
       exactly:
         deviceClassName: cpu.dra.k8s.io
         count: 16
     constraints:
-    - matchAttribute: resource.kubernetes.io/numaNode
-      requests: [gpu0, gpu1, nic, cpus]
     - matchAttribute: resource.kubernetes.io/pcieRoot
-      requests: [gpu0, gpu1, nic, cpus]
+      requests: [gpu0, gpu1, nic]
+    - matchAttribute: resource.kubernetes.io/numaNode
 ```
 
-The `pcieRoot` constraint spans all four requests even though the CPU
-group publishes `pcieRoot` as a list while the GPU and NIC publish it as
-a scalar. See External Dependencies for the KEP-5491 set-intersection
-semantics that make this match.
-
-The `count: 16` on the CPU request assumes a driver operating in count
-mode. A capacity-mode driver would express the same request differently
-(see algorithm step 1d).
+The built-in provisioner selected the GPU and NIC requests for the
+PCIe-root constraint and all requests for the NUMA constraint. Its
+pairing and constraint policy is implementation behavior, not part of
+the `ManagedClaimProvisioner` API. The CPU DRA driver publishes
+`pcieRoot` as a list attribute (KEP-5491); `matchAttribute` uses set
+intersection.
 
 ## Alternatives
 
@@ -787,15 +782,16 @@ mode. A capacity-mode driver would express the same request differently
 
 The initial design (from
 [VEP-10 Appendix C](../10-dra-devices/vep.md#c-managed-resource-claims))
-placed topology policy (`align`) and DeviceClass names directly on the
-VMI spec via a `managedClaim` field on `resourceClaims[]` and
-`deviceClassName` on each device declaration. Admin defaults were
-configured in the KubeVirt CR (`managedClaimDefaults`).
+placed device constraints (`matchAttribute` / `distinctAttribute`) and
+DeviceClass names directly on the VMI spec via a `managedClaim` field on
+`resourceClaims[]` and `deviceClassName` on each device declaration.
+Admin defaults were configured in the KubeVirt CR
+(`managedClaimDefaults`).
 
 Rejected because:
-- DeviceClass names and topology policy are admin concerns, not user
+- DeviceClass names and device constraints are admin concerns, not user
   concerns. Putting them in the VMI leaks infrastructure details.
-- No extensibility for external controllers without adding a
+- No extensibility for independent provisioner controllers without adding a
   `controllerName` field (which duplicates what the CRD's `provisioner`
   field does more cleanly).
 - Admin defaults in the KubeVirt CR are a single global config. The
@@ -816,19 +812,27 @@ Rejected because:
 - Kubernetes made the same decision when implementing DRA extended
   resources in the scheduler instead of a webhook.
 
-### Alternative 3: No KubeVirt involvement (external-only)
+### Alternative 3: No KubeVirt managed-claim framework
 
-Users install an external controller (e.g., topology coordinator) that
-watches VMIs and generates ResourceClaims independently. KubeVirt has
-no managed claim API at all.
+Users install a separate controller (for example, a topology
+coordinator) that watches VMIs and generates ResourceClaims
+independently. KubeVirt has no managed-claim API or framework.
 
 Rejected because:
-- No standard contract between KubeVirt and external controllers
+- No standard contract between KubeVirt and separate controllers
   (how does virt-controller know when to proceed with pod creation?).
 - Every external implementation reinvents the same integration
-  (status tracking, expectations, ownership).
+  (naming, expectations, ownership).
 - KubeVirt should provide a built-in default implementation while
-  allowing external extensibility via the `provisioner` field.
+  allowing independent provisioner controllers.
+
+## Implementation History
+
+- 2026-08-05: Initial VEP draft based on VEP-10 Appendix C design
+- 2026-08-11: Redesigned with ManagedClaimProvisioner CRD based on
+  feedback from Alay Patel (VEP owner)
+- 2026-08-12: Added controller-based generation
+- 2026-08-13: Aligned CPUDRASource with VEP-152
 
 ## Scalability
 
@@ -848,12 +852,15 @@ scalability model. See
 
 ## Functional Testing Approach
 
-- Unit tests for `GenerateManagedClaim`: single device, multi-device,
-  topology alignment, shorthand expansion, error cases
-- Unit tests for validation: mutual exclusion, missing provisioner,
-  invalid align values, empty claims, duplicate request names,
-  provisioner existence
+- Unit tests for framework reconciliation and `GenerateClaim`: single
+  device, multi-device, built-in topology constraint generation,
+  opaque configuration rendering, and error cases
+- Unit tests for validation: mutual exclusion, missing DeviceClassName,
+  invalid device type configuration, empty claims, duplicate request
+  names, and provisioner existence
 - Integration tests with fake ManagedClaimProvisioner objects (envtest)
+- Integration tests: provisioning failure sets and successful
+  reconciliation clears `ManagedClaimProvisioningFailed`
 - E2E: VMI with managed claim for GPU (requires DRA driver in CI)
 
 ## Graduation Requirements
@@ -861,13 +868,17 @@ scalability model. See
 ### Alpha
 
 - `ManagedClaimProvisioner` CRD (cluster-scoped)
-- `managedClaimProvisioner` field on `VirtualMachineInstanceResourceClaim`
-- Built-in provisioner controller (`policy.kubevirt.io/aligner`)
+- `managedClaimProvisionerName` field on
+  `VirtualMachineInstanceResourceClaim`
+- Managed-claim framework and built-in topology provisioner
+  (`policy.kubevirt.io/aligner`)
 - API changes behind `ManagedDRAClaims` feature gate (off by default)
 - GPU, HostDevice, Network, and CPU support
-- Topology alignment with `align: [numaNode]` and `align: [pcieRoot]`
-- Controller-based claim generation with status tracking
-- External controller extensibility via `provisioner` field
+- Built-in PCIe-root and NUMA topology constraint generation
+- Opaque device configuration rendering
+- Controller-based claim generation with deterministic claim naming
+- User-visible provisioning failure condition
+- Independent provisioner controllers selected by `provisioner`
 - Validation
 - Unit tests and mock e2e tests
 - Requires KEP-6072 (GA in Kubernetes 1.37)
@@ -893,25 +904,15 @@ scalability model. See
   entries with names, devices reference by name
 - **Memory and hugepages:** when the CPU DRA driver adds memory
   allocation support, memory can participate in managed claims
-- **Preference-based alignment:** `prefer` vs `require` enforcement
-  for topology constraints
-
-## Implementation History
-
-- 2026-08-05: Initial VEP draft based on VEP-10 Appendix C design
-- 2026-08-11: Redesigned with ManagedClaimProvisioner CRD based on
-  feedback from Alay Patel (VEP owner)
-- 2026-08-12: Added controller-based generation, external controller
-  contract, status tracking
-- 2026-08-13: Aligned CPUDRASource with VEP-152
 
 ## References
 
 - [VEP-10: Support GPUs with DRA](../10-dra-devices/vep.md) (Appendix C:
   Managed Resource Claims)
-- [VEP-115: PCIe NUMA Topology Awareness](../115-pcie-numa-topology-awareness/vep.md)
-- [VEP-152: Support CPUs with DRA (PR #414)](https://github.com/kubevirt/enhancements/pull/414)
+- [VEP-115: PCIe NUMA Topology Awareness](../115-pcie-numa-topology-awareness/pcie-numa-topology-awareness.md)
+- [VEP-152: Support CPUs with DRA](../152-cpu-dra/vep.md)
 - [VEP-183: DRA for Network Devices](../../sig-network/183-dra-network/vep.md)
+- [ResourceClaim DeviceConstraint](https://kubernetes.io/docs/reference/kubernetes-api/resource/resource-claim-v1/#DeviceConstraint)
 - [KEP-6072: Standard Topology Attributes](https://github.com/kubernetes/enhancements/issues/6072)
 - [KEP-5491: List Types for Attributes](https://github.com/kubernetes/enhancements/issues/5491)
 - [KEP-5304: DRA Device Attributes Downward API](https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/5304-dra-attributes-downward-api)
