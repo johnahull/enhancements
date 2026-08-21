@@ -285,7 +285,8 @@ device types. The DeviceClassName is resolved from the provisioner
 CRD's `cpu.deviceClassName` field. The CPU count in the
 generated claim is derived from VEP-152's accounting formula
 (`cores x sockets x threads + emulatorThreadCPUs + supplementalPoolThreadCount`).
-See [VEP-152 CPU accounting](../152-cpu-dra/vep.md) for details.
+See [VEP-152 (PR #414)](https://github.com/kubevirt/enhancements/pull/414)
+for details.
 
 ### DeviceClassName Resolution
 
@@ -909,8 +910,8 @@ scalability model. See
 
 - [VEP-10: Support GPUs with DRA](../10-dra-devices/vep.md) (Appendix C:
   Managed Resource Claims)
-- [VEP-115: PCIe NUMA Topology Awareness](../115-pcie-numa-topology-awareness/pcie-numa-topology-awareness.md)
-- [VEP-152: Support CPUs with DRA](../152-cpu-dra/vep.md)
+- [VEP-115: PCIe NUMA Topology Awareness](../115-pcie-numa-topology-awareness/vep.md)
+- [VEP-152: Support CPUs with DRA (PR #414)](https://github.com/kubevirt/enhancements/pull/414)
 - [VEP-183: DRA for Network Devices](../../sig-network/183-dra-network/vep.md)
 - [ResourceClaim DeviceConstraint](https://kubernetes.io/docs/reference/kubernetes-api/resource/resource-claim-v1/#DeviceConstraint)
 - [KEP-6072: Standard Topology Attributes](https://github.com/kubernetes/enhancements/issues/6072)
