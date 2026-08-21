@@ -203,6 +203,8 @@ for KubeVirt GPU DRA claims.
 
 ```go
 type ManagedClaimProvisionerSpec struct {
+	Provisioner string `json:"provisioner"`
+
 	// +listType=map
 	// +listMapKey=name
 	DeviceTypes []ManagedClaimDeviceType `json:"deviceTypes"`
@@ -214,6 +216,10 @@ type ManagedClaimDeviceType struct {
 	Opaque          *resourcev1.OpaqueDeviceConfiguration `json:"opaque,omitempty"`
 }
 ```
+
+The YAML fields map directly to this spec: `provisioner` identifies the
+controller, and each `deviceTypes[]` entry maps to
+`ManagedClaimDeviceType`.
 
 #### Modified: `VirtualMachineInstanceResourceClaim`
 
@@ -453,7 +459,8 @@ framework converges it to the provisioner's desired spec.
 
 **RBAC:** the built-in provisioner controller needs `create`, `get`,
 `list`, `watch`, `update`, and `delete` permissions on `resourceclaims`
-in the `resource.k8s.io` API group. Third-party provisioner controllers
+in the `resource.k8s.io` API group, plus `patch` permission on
+`virtualmachineinstances/status`. Third-party provisioner controllers
 need equivalent permissions in their own RBAC configuration.
 
 **Multiple managed claims per VMI:** a VMI can have multiple
@@ -486,11 +493,21 @@ The validating webhook enforces:
    a managed claim.
 ### Error Handling
 
+Provisioner controllers report their own failures through the existing
+VMI status conditions list. The condition type
+`ManagedClaimProvisioningFailed` includes the managed claim entry and
+provisioner name in its reason and message; it is diagnostic only and
+is not a pod-creation readiness handshake.
+
 **Claim generation failure:** if a provisioner controller cannot
 generate a claim (for example, no DeviceClassName is resolvable), it
-emits a `FailedCreateResourceClaim` event on the VMI and retries on the
-next reconciliation. The launcher pod remains pending until the claim
-exists and can be allocated.
+sets a `ManagedClaimProvisioningFailed` condition on the VMI. The
+condition reason is `FailedCreateResourceClaim`; its message identifies
+the managed claim entry, provisioner name, and error. The controller
+also emits a `FailedCreateResourceClaim` event and retries on the next
+reconciliation. It clears the condition after successfully reconciling
+the claim. The launcher pod remains pending until the claim exists and
+can be allocated.
 
 **ResourceClaim deleted externally:** if a managed claim's ResourceClaim
 is deleted while the VMI is running, its provisioner controller detects
@@ -837,10 +854,13 @@ scalability model. See
 
 - Unit tests for framework reconciliation and `GenerateClaim`: single
   device, multi-device, built-in topology constraint generation,
-  error cases
+  opaque configuration rendering, and error cases
 - Unit tests for validation: mutual exclusion, missing DeviceClassName,
-  empty claims, duplicate request names, provisioner existence
+  invalid device type configuration, empty claims, duplicate request
+  names, and provisioner existence
 - Integration tests with fake ManagedClaimProvisioner objects (envtest)
+- Integration tests: provisioning failure sets and successful
+  reconciliation clears `ManagedClaimProvisioningFailed`
 - E2E: VMI with managed claim for GPU (requires DRA driver in CI)
 
 ## Graduation Requirements
@@ -855,7 +875,9 @@ scalability model. See
 - API changes behind `ManagedDRAClaims` feature gate (off by default)
 - GPU, HostDevice, Network, and CPU support
 - Built-in PCIe-root and NUMA topology constraint generation
+- Opaque device configuration rendering
 - Controller-based claim generation with deterministic claim naming
+- User-visible provisioning failure condition
 - Independent provisioner controllers selected by `provisioner`
 - Validation
 - Unit tests and mock e2e tests
@@ -890,7 +912,6 @@ scalability model. See
 - [VEP-115: PCIe NUMA Topology Awareness](../115-pcie-numa-topology-awareness/pcie-numa-topology-awareness.md)
 - [VEP-152: Support CPUs with DRA](../152-cpu-dra/vep.md)
 - [VEP-183: DRA for Network Devices](../../sig-network/183-dra-network/vep.md)
-- [KubeVirt GPU DRA configuration](https://kubevirt.io/user-guide/compute/dra_gpu/)
 - [ResourceClaim DeviceConstraint](https://kubernetes.io/docs/reference/kubernetes-api/resource/resource-claim-v1/#DeviceConstraint)
 - [KEP-6072: Standard Topology Attributes](https://github.com/kubernetes/enhancements/issues/6072)
 - [KEP-5491: List Types for Attributes](https://github.com/kubernetes/enhancements/issues/5491)
