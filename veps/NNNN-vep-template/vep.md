@@ -86,6 +86,16 @@ Tangible API examples used for discussion
 Outline any alternative designs that have been considered)
 -->
 
+## Does it belong to core KubeVirt?
+
+<!--
+Explain why this feature belongs to the core KubeVirt repository and which other alternatives were considered.
+Other alternatives can be:
+- External controllers.
+- Plugins (see VEP-190).
+- Other existing repositories in the KubeVirt organization (e.g. HCO / CDI / etc.).
+-->
+
 ## Scalability
 
 <!--
@@ -133,5 +143,12 @@ Refer to https://github.com/kubevirt/community/blob/main/design-proposals/featur
 ### Alpha
 
 ### Beta
+
+#### On-By-Default Readiness
+
+<!--
+Beta features are enabled by default.
+In this section, please specify what needs to be done in order for the VEP to be ready to be enabled by default.
+-->
 
 ### GA
