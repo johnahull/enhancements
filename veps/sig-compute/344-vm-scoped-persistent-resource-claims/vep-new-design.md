@@ -649,6 +649,29 @@ Rejected because an anchor Pod adds a second workload, complicates scheduling,
 and makes VM deletion and failure handling harder. The VM consumer reference is
 the Kubernetes-native mechanism for retaining the allocation.
 
+### Single Allocation Policy
+
+Instead of exposing separate persistence fields such as
+`persistWhenStopped` and `persistOnRestart`, define one user-facing
+`allocationPolicy`:
+
+```yaml
+resourceClaims:
+- name: gpu
+  resourceClaimName: gpu-claim
+  allocationPolicy: WhileRunning
+```
+
+Possible values could be:
+
+- `Persistent`: retain the allocation across restart and stop.
+- `WhileRunning`: retain it across restart, but release it when stopped.
+- `Ephemeral`: release and reallocate it on restart or stop.
+
+This API describes how long the user wants the allocation retained without
+exposing internal VMI or Pod lifecycle terminology. It is an open design
+consideration; the final API should be selected after user and SIG review.
+
 ## Scalability
 
 - Each VM contributes at most one reservation per VM-scoped claim.
