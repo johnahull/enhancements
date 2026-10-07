@@ -4,8 +4,8 @@
 
 ### Target releases
 
-- This VEP targets alpha for version: v1.10.0
-- This VEP targets beta for version: TBD
+- This VEP targets alpha for version: v1.11.0
+- This VEP targets beta for version: TBD (no earlier than v1.13.0)
 - This VEP targets GA for version: TBD
 
 ### Release Signoff Checklist
@@ -33,7 +33,8 @@ replacement.
 In alpha, KubeVirt creates, names, owns, and deletes no claim objects. It
 writes exactly one field — the consumer reference — on claims the user already
 owns. ResourceClaimTemplate-backed claims and VEP-300 managed claims extend
-this same mechanism at beta, once claim creation and ownership are added; this
+this same mechanism in a second alpha milestone (v1.12), once claim creation
+and ownership are added; this
 document describes their shape so the alpha mechanism is designed to extend
 cleanly into them, but they are not part of the alpha surface.
 
@@ -71,7 +72,8 @@ to the VM. The VM therefore needs to be represented as a DRA claim consumer.
 - Prevent KubeVirt from modifying or deleting user-owned direct claims.
 - Clean up KubeVirt-owned reservations during VM deletion.
 - Design the mechanism so that ResourceClaimTemplate-backed and VEP-300
-  managed claims can adopt it at beta without a second persistence model.
+  managed claims can adopt it in alpha 2 (v1.12) without a second
+  persistence model.
 
 ## Non Goals
 
@@ -82,15 +84,17 @@ to the VM. The VM therefore needs to be represented as a DRA claim consumer.
   [Scheduling and Migration Constraints](#scheduling-and-migration-constraints).
 - Eagerly allocating claims for halted VMs.
 - Creating, naming, or owning ResourceClaim objects in alpha. This is
-  explicitly deferred to beta; see
-  [ResourceClaimTemplates (Beta)](#resourceclaimtemplates-beta) and
-  [Managed Claims (Beta)](#managed-claims-beta).
+  explicitly deferred to a second alpha milestone (v1.12); see
+  [ResourceClaimTemplates (Alpha 2)](#resourceclaimtemplates-alpha-2) and
+  [Managed Claims (Alpha 2)](#managed-claims-alpha-2).
 - Defining device-specific request semantics owned by VEP-152, VEP-183, or
   other device-specific proposals.
 - Changing the managed claim generation model defined by VEP-300 beyond the
   additions required for VM scope.
 - Mutating an allocated `ResourceClaim.spec` in place.
-- Defining a general-purpose shared-claim policy for multiple VMs.
+- Defining a general-purpose shared-claim policy for multiple VMs. Only the
+  VM-versus-VM conflict case is defined, as first-holder-wins with a conflict
+  condition.
 
 ## Definition of Users
 
@@ -100,7 +104,7 @@ to the VM. The VM therefore needs to be represented as a DRA claim consumer.
 - **Cluster administrator:** A person who installs DRA drivers, configures
   ResourceClaimTemplates, and grants RBAC to the reservation controller.
 - **Provisioner author:** A person who implements a VEP-300 managed claim
-  provisioner (beta).
+  provisioner (alpha 2).
 
 ## User Stories
 
@@ -120,7 +124,7 @@ to the VM. The VM therefore needs to be represented as a DRA claim consumer.
   across virt-controller.
 - As a provisioner author, I want the managed claim framework to identify
   whether a claim belongs to a VM or a standalone VMI, once VEP-300 adopts
-  this mechanism at beta.
+  this mechanism in alpha 2 (v1.12).
 - As a KubeVirt developer, I want the generated VMI to be an implementation
   detail rather than a second user-facing claim configuration surface.
 
@@ -148,7 +152,7 @@ reservation controller maintains status.reservedFor
 
 In alpha this is literally all there is: KubeVirt does not create, name, own,
 or delete any claim object. It resolves the user's existing
-`resourceClaimName` reference and maintains one status field. At beta, when
+`resourceClaimName` reference and maintains one status field. In alpha 2, when
 template-backed and managed claims are added, a claim source resolver is
 introduced ahead of this pipeline to produce the concrete claim — but the
 reservation controller downstream of it does not change. There must not be one
@@ -192,8 +196,9 @@ type VirtualMachineInstanceResourceClaim struct {
 	// Name uniquely identifies this claim inside the VM or VMI.
 	Name string `json:"name"`
 
-	// Exactly one of ResourceClaimName or ResourceClaimTemplateName must
-	// be set. (ManagedClaimProvisionerName is added at beta, see VEP-300.)
+	// Exactly one claim source must be set. Alpha 1 accepts only
+	// ResourceClaimName; the webhook rejects ResourceClaimTemplateName until
+	// alpha 2. (ManagedClaimProvisionerName is added in alpha 2, see VEP-300.)
 	ResourceClaimName *string `json:"resourceClaimName,omitempty"`
 
 	ResourceClaimTemplateName *string `json:"resourceClaimTemplateName,omitempty"`
@@ -222,8 +227,10 @@ The following table defines each value precisely, in terms of
 | `Persistent` | yes, once allocated | allocation retained | VM reservation retained |
 
 `Ephemeral` is specified as exactly today's VMI-scoped behavior, so that it is
-a true no-op: the reservation controller never touches a claim whose entry has
-the default policy. This is deliberate — the alternative of defaulting to
+a true no-op: the reservation controller never *adds* a reservation for an entry with the
+default policy. (If an entry's policy is changed to `Ephemeral`, the controller
+removes the reservation it previously added; see
+[Reservation Controller](#reservation-controller).) This is deliberate — the alternative of defaulting to
 `WhileRunning` would make the motivating restart-stability guarantee the
 default behavior, but it would also mean a controller bug on day one of the
 feature gate could change the behavior of VMs that never opted in. See
@@ -267,17 +274,20 @@ already created. For a direct claim:
 - KubeVirt never deletes the claim.
 - KubeVirt adds and removes only its VM consumer reference.
 
-The user remains responsible for creating and deleting the direct claim. If
-the claim is already reserved for an incompatible consumer, the VM reports a
-reservation conflict and does not start.
+The user remains responsible for creating and deleting the direct claim. The
+reservation controller never blocks VM start. It adds the VM reservation only
+after the VM's own launcher Pod appears in the claim's `reservedFor`, which
+proves the Kubernetes scheduler accepted this VM as a consumer. If the claim
+cannot be shared with the VM's Pod, ordinary DRA scheduling behavior applies
+(the Pod stays unschedulable) and no VM reservation is written.
 
 No claim is created, named, or owned by KubeVirt in alpha. The remainder of
-this section describes the beta extensions; they are included here so the
+this section describes the alpha 2 extensions; they are included here so the
 alpha reservation mechanism — described in
 [Reservation Controller](#reservation-controller) — is designed to extend to
 them without modification.
 
-### ResourceClaimTemplates (Beta)
+### ResourceClaimTemplates (Alpha 2)
 
 For a VM-scoped `resourceClaimTemplateName`:
 
@@ -308,16 +318,16 @@ generated from the VM template is rewritten from
 `resourceClaimTemplateName` to the concrete `resourceClaimName` before the VMI
 is created. If this rewrite is skipped, virt-launcher looks for metadata under
 the template path, finds none, and the device never reaches the libvirt
-domain. This rewrite is required for beta template support; it has no alpha
+domain. This rewrite is required for alpha 2 template support; it has no alpha
 analog, since alpha has no template-backed source to rewrite.
 
-### Managed Claims (Beta)
+### Managed Claims (Alpha 2)
 
-VEP-300 ([kubevirt/enhancements#432](https://github.com/kubevirt/enhancements/pull/432),
-open, unmerged) is extended to support managed claims originating from a VM
-template. This extension is sequenced after VEP-300 merges; the API deltas
-below belong in that proposal and are shown here only to describe the shape
-the reservation mechanism must accommodate.
+VEP-300 ([kubevirt/enhancements#432](https://github.com/kubevirt/enhancements/pull/432))
+is extended to support managed claims originating from a VM template. VEP-300
+targets alpha in v1.11; this VM-scope extension builds on it and targets v1.12.
+The API deltas below belong in VEP-300 for that release and are shown here
+only to describe the shape the reservation mechanism must accommodate.
 
 For a VM-scoped managed claim:
 
@@ -365,13 +375,13 @@ type ManagedClaimProvisionerSpec struct {
 ```
 
 When `supportedScopes` is omitted, the provisioner supports only VMI scope for
-backward compatibility. Beta also requires enabling both `ManagedDRAClaims`
+backward compatibility. Alpha 2 also requires enabling both `ManagedDRAClaims`
 (VEP-300) and `PersistentDRAClaims` (this VEP) together for VM-scoped managed
 claims; neither gate alone is sufficient.
 
-### Claim Naming and Ownership (Beta)
+### Claim Naming and Ownership (Alpha 2)
 
-This section applies only to the beta ResourceClaimTemplates and Managed
+This section applies only to the alpha 2 ResourceClaimTemplates and Managed
 Claims sources; alpha creates no claim objects.
 
 Direct claims retain their user-provided name.
@@ -405,8 +415,8 @@ function.
 ### Launcher Pod References
 
 For VM-scoped claims, the launcher Pod always references a concrete
-`resourceClaimName`. In alpha this is simply the user's own claim name. At
-beta, for template-backed and managed claims, it is the generated claim's
+`resourceClaimName`. In alpha 1 this is simply the user's own claim name. In
+alpha 2, for template-backed and managed claims, it is the generated claim's
 name. The Pod does not reference a `resourceClaimTemplateName`, and it does
 not need to know whether the concrete claim was direct, template-backed, or
 managed.
@@ -429,24 +439,42 @@ virt-controller, which has a much larger attack surface.
 
 The controller:
 
-- watches ResourceClaims and VirtualMachines (and, at beta,
-  VirtualMachineInstances for the rewritten template references);
+- watches ResourceClaims, VirtualMachines, and VirtualMachineInstances (to
+  identify the current launcher Pod and whether the VM is running);
 - for every VM-scoped claim entry with a non-`Ephemeral` `allocationPolicy`,
-  adds the VM reservation once the claim is allocated;
+  adds the VM reservation once the claim is allocated **and** the VM's own
+  launcher Pod is present in `reservedFor`. Waiting for the Pod ensures the VM
+  never attaches itself to an allocation held by an unrelated workload;
+- writes the reservation entry as `{apiGroup: kubevirt.io, resource:
+  virtualmachines, name, uid}` and requires Kubernetes 1.34+ (`resource.k8s.io/v1`);
 - retains the reservation across VMI and launcher Pod replacement;
 - preserves Pod and other consumer references already on the claim;
 - removes the VM reservation on explicit stop when `allocationPolicy` is
   `WhileRunning`, and on VM deletion regardless of policy;
 - updates the claim with conflict retries;
 - removes only the VM's own reservation, never another consumer's;
+- if another VM already holds a non-`Ephemeral` reservation on the same
+  claim, leaves the first holder in place and sets a conflict condition on the
+  second VM instead of adding a reservation (first writer wins; the controller
+  indexes claim to VM for this);
+- reconciles from the claim side as well as the VM spec: it finds claims whose
+  `reservedFor` carries this VM's entry and removes the reservation when the
+  VM template no longer wants it. This covers a policy change to `Ephemeral`,
+  a changed `resourceClaimName`, and a removed claim entry. Policy changes
+  take effect from the VM template, including on a running VM, and the
+  reservation is added or removed without restarting the VMI;
+- keeps running finalizer and reservation-removal logic even when the
+  `PersistentDRAClaims` gate is disabled, so disabling the gate never leaves a
+  VM undeletable;
 - owns a dedicated VM finalizer (for example,
   `dra.kubevirt.io/reservation-protection`) so that virt-controller requires
   no coordination logic for VM deletion.
 
-virt-controller's only remaining responsibility for VM-scoped claims is
-resolving the claim name (direct in alpha; generated at beta) and rendering it
-into the launcher Pod spec — work it already performs for VMI-scoped claims
-today.
+virt-controller's remaining responsibilities for VM-scoped claims are
+resolving the claim name (direct in alpha; generated in alpha 2) and rendering
+it into the launcher Pod spec — work it already performs for VMI-scoped claims
+today — and honoring the `ReservationEstablished` gate described in
+[Allocation-to-Reservation Race](#allocation-to-reservation-race).
 
 **Controller availability.** If the reservation controller is unavailable:
 
@@ -470,11 +498,22 @@ There is a small unavoidable race between DRA allocation and the first VM
 reservation update, because Kubernetes rejects a reservation write against an
 unallocated claim — this is enforced by the Kubernetes API server, not merely
 a convention the controller must follow. The reservation controller must
-minimize this window and ensure the VM reservation is installed before
-deleting a launcher Pod for an intentional stop. It must report reservation
-failures and retry them.
+minimize this window, and must report reservation failures and retry them.
 
-**Unplanned Pod loss.** The mitigation above only covers an intentional stop.
+**Gating intentional stops and restarts.** For every claim entry with a
+non-`Ephemeral` policy, the reservation controller sets a
+`ReservationEstablished` condition on the VM once the VM reservation is
+present on that claim (and clears it while the reservation is missing or being
+removed). Before deleting the launcher Pod for an intentional stop or restart,
+virt-controller waits for this condition to be true for every such claim, up
+to a bounded timeout, after which it proceeds and emits a warning event that
+the retention guarantee did not hold for that cycle. The bounded wait ensures a
+stuck or unavailable reservation controller cannot block a stop or restart
+indefinitely. This is the one coupling between the two controllers; it is
+read-only for virt-controller (it reads a condition and holds no claim
+permissions).
+
+**Unplanned Pod loss.** The gate above only covers an intentional stop or restart.
 If the launcher Pod is lost before the reservation is installed — node
 failure, OOM-kill, eviction, or any other unplanned deletion — the allocation
 is released with the Pod regardless of `allocationPolicy`, and restart may
@@ -485,6 +524,13 @@ reservation write. The window is expected to be short (one reconcile cycle)
 but is not zero. Tests must cover and report its observed duration.
 
 ### Explicit Stop
+
+An explicit stop means the VM's desired state is not running: `runStrategy:
+Halted` (including `virtctl stop`), or a stopped VM under `Manual`/`Once`.
+VMI recreation by `virtctl restart`, or by `Always` / `RerunOnFailure`
+recovery, is replacement, not a stop. Guest-initiated poweroff under
+`RerunOnFailure` leaves the VM stopped and is treated as an explicit stop.
+This mapping is to be confirmed with sig-compute before alpha.
 
 When a VM is explicitly stopped:
 
@@ -499,8 +545,10 @@ user-owned and is never deleted by KubeVirt.
 
 ### Scheduling and Migration Constraints
 
-A retained allocation (`WhileRunning` or `Persistent`) is node-specific: once
-a claim's `status.allocation.nodeSelector` is set, Kubernetes restricts any
+A retained allocation (`WhileRunning` or `Persistent`) is node-specific when
+the allocated devices are node-local: once a claim's
+`status.allocation.nodeSelector` is set (network-attached devices may leave it
+unset and then do not pin), Kubernetes restricts any
 future consumer of that claim — including a replacement launcher Pod — to the
 nodes matching that selector. This has two consequences, and the first is
 easy to overlook:
@@ -515,7 +563,8 @@ easy to overlook:
    the user choosing a non-`Ephemeral` policy.
 2. **Live migration is not supported.** VM-scoped DRA allocations are not
    live-migratable by this VEP. VMs using a non-`Ephemeral` VM-scoped DRA
-   claim must be marked as not live-migratable unless a future DRA-aware
+   claim must be marked as not live-migratable (virt-controller sets the VMI's
+`LiveMigratable` condition to false) unless a future DRA-aware
    migration design (see VEP-109 for the analogous vGPU case) provides
    equivalent guarantees.
 
@@ -527,19 +576,22 @@ user-owned claim directly and starts the VM again:
 
 ```text
 1. Ensure the VM is stopped.
-2. kubectl delete resourceclaim <claim-name>
-3. virtctl start <vm-name>
+2. If allocationPolicy is Persistent, set it to WhileRunning (or Ephemeral)
+   and wait for the VM reservation to be removed from the claim.
+3. kubectl delete resourceclaim <claim-name>
+4. Recreate the claim (or point the VM at a new one) and virtctl start <vm-name>
 ```
 
-Because alpha claims are always user-owned direct claims, this requires no
-controller-side support beyond the ordinary reservation reconciliation: once
-the claim is gone, there is no reservation to preserve, and the next start
-resolves a fresh (or newly user-created) claim as normal. Deleting the claim
-while the VM is running has no effect until the next replacement of the
+Step 2 is required: a claim cannot finish deleting while `reservedFor` is
+non-empty, so deleting a claim that still carries a `Persistent` VM
+reservation leaves it stuck in `Terminating` and the next start fails. Using
+the policy change to drop the reservation means the procedure needs only
+ordinary VM and claim permissions, not `resourceclaims/binding`. Deleting the
+claim while the VM is running has no effect until the next replacement of the
 launcher Pod, since the running Pod already holds the device.
 
 A single-step API (for example, a `reallocateOnNextStart` field) is a
-candidate for beta once generated claims exist, where the controller — not
+candidate for alpha 2 once generated claims exist, where the controller — not
 the user — would own the delete step. For alpha, the manual approach is
 sufficient; reallocation is an exceptional operation.
 
@@ -556,7 +608,7 @@ During VM deletion:
    [Reservation Leak and Recovery](#reservation-leak-and-recovery) for what
    happens if it cannot).
 3. The VM finalizer is removed.
-4. For beta-only generated claims, Kubernetes garbage collection removes the
+4. For alpha-2-only generated claims, Kubernetes garbage collection removes the
    KubeVirt-owned claim via its owner reference. Alpha has no generated
    claims to collect.
 
@@ -579,12 +631,18 @@ This can happen when:
 
 - the reservation controller fails repeatedly while processing VM deletion
   and exhausts retries without operator intervention;
-- a VM is force-deleted (`kubectl delete vm --force --grace-period=0`),
-  which removes the VM object before any finalizer-driven cleanup completes;
+- the VM's finalizer is removed by other means (for example a controller
+  with broad patch permissions, or an older KubeVirt that does not know it)
+  before cleanup completes;
 - a cluster administrator manually clears the
   `dra.kubevirt.io/reservation-protection` finalizer to unblock a deletion;
 - the cluster is downgraded to a KubeVirt build that predates this VEP and
   does not know to remove VM reservations.
+
+**Automatic cleanup.** A reservation entry whose VM no longer exists, or
+exists with a different UID, is unambiguously dangling. The reservation
+controller removes such entries itself, using the privilege it already holds,
+in addition to reporting them. Manual removal below is the fallback.
 
 **Detection.** The reservation controller must expose a metric counting
 claims with a VM reservation whose owning VM no longer exists (that is, a
@@ -600,7 +658,11 @@ supported operator procedure, not an unsupported workaround. The alpha
 documentation must include this procedure explicitly, including the RBAC an
 administrator needs to perform it.
 
-**Downgrade.** A controller version that does not understand VM reservations
+**Downgrade.** An older KubeVirt that predates the
+`dra.kubevirt.io/reservation-protection` finalizer will not remove it, so VM
+deletion hangs until the finalizer is cleared manually, and any `Persistent`
+reservations leak. Remove the finalizers (after clearing reservations) before
+downgrading. A controller version that does not understand VM reservations
 must not attempt to delete or mutate a ResourceClaim that still carries one;
 doing so could violate the reservation the newer controller relied on. The
 safe downgrade path is: before downgrading, ensure no VM-scoped claim has a
@@ -615,7 +677,7 @@ references).
 Kubernetes defines `ResourceClaim.spec` as immutable. KubeVirt must not update
 the spec of a direct claim or an allocated generated claim in place.
 
-At beta, if a VM template change would change the desired spec of a generated
+In alpha 2, if a VM template change would change the desired spec of a generated
 claim, the controller must:
 
 - detect the difference;
@@ -625,7 +687,7 @@ claim, the controller must:
   [Manual Reallocation](#manual-reallocation)).
 
 Changing only `allocationPolicy` does not change the ResourceClaim spec, in
-either alpha or beta.
+either alpha 1 or alpha 2.
 
 ### Relationship to VEP-10
 
@@ -646,8 +708,8 @@ yet, which cannot be known from CDI metadata alone — so a watch is
 unavoidable here. Isolating it in its own controller also keeps it out of
 virt-controller's already-large reconcile surface.
 
-The VMI-entry rewrite required for beta ResourceClaimTemplate support (see
-[ResourceClaimTemplates (Beta)](#resourceclaimtemplates-beta)) also interacts
+The VMI-entry rewrite required for alpha 2 ResourceClaimTemplate support (see
+[ResourceClaimTemplates (Alpha 2)](#resourceclaimtemplates-alpha-2)) also interacts
 directly with VEP-10's virt-launcher metadata-path resolution; that
 interaction is described there rather than repeated here.
 
@@ -662,14 +724,27 @@ The validating webhook enforces, in alpha:
 3. `allocationPolicy` other than `Ephemeral` is only accepted for a claim
    declared in a VM template; a standalone VMI may not request
    `WhileRunning` or `Persistent`, because it has no VM object to serve as
-   the reservation's consumer reference.
-4. The referenced claim is in the VM's namespace.
+   the reservation's consumer reference. A VMI carrying a non-`Ephemeral`
+   policy is accepted only when the admission request comes from
+   virt-controller's ServiceAccount. A controller `ownerReference` is not
+   trusted for this, because a user can set one by hand.
+4. `resourceClaimName` is a plain name, so the claim is always in the VM's
+   namespace. The webhook does not require the claim to exist at admission;
+   a missing claim is reported as a condition by the controller.
 5. Claim names are unique within the VM template.
 6. A VM-generated VMI does not independently change the VM-scoped claim
    source or allocation policy.
+7. The requesting user must be authorized to `get` and `update` the
+   referenced ResourceClaim, checked with a SubjectAccessReview at admission
+   of the VM. Without this, a user who can only create VMs could cause the
+   privileged reservation controller to pin a claim in the same namespace
+   that they cannot otherwise modify. If the claim does not yet exist
+   at admission, it cannot be checked; this is a residual gap, so users are
+   advised to create claims before the VMs that reference them. virt-api
+   needs `create` on `subjectaccessreviews` for this check.
 
 Additional rules apply once ResourceClaimTemplates and managed claims are
-added at beta: mutual exclusion across the three source fields, template/
+added in alpha 2: mutual exclusion across the three source fields, template/
 provisioner namespace checks, managed claim provisioner existence and scope
 support, and the requirement that every claim entry be referenced by at
 least one device declaration.
@@ -690,6 +765,8 @@ The reservation controller's ServiceAccount requires permission to:
   `resourceclaims/status` update;
 - get, list, and watch VirtualMachines, and update them for its own
   finalizer;
+- get, list, and watch VirtualMachineInstances and Pods, to identify the
+  current launcher Pod;
 - emit events.
 
 This is the entire RBAC footprint for the reservation controller, and it is
@@ -697,9 +774,11 @@ not granted to virt-controller. virt-controller's existing RBAC is
 unchanged by this VEP; it only needs to read the resolved claim name to
 render it into the launcher Pod, which does not require any new permission.
 
-At beta, the reservation controller additionally needs create and delete
-permission on generated ResourceClaims (for template-backed and managed
-sources), and get/list/watch on ResourceClaimTemplates. Managed claim
+In alpha 2, claim creation and deletion (generated ResourceClaims from
+templates) and get/list/watch on ResourceClaimTemplates go to the claim source
+resolver's own identity, **not** the reservation controller. The reservation
+controller is the only holder of `resourceclaims/binding`, and it must not
+also gain create/delete on claims. Managed claim
 provisioners require the permissions defined by VEP-300.
 
 ### Security Considerations
@@ -724,9 +803,11 @@ loop is adding or removing a single `reservedFor` entry per VM-scoped claim.
 This directly narrows the blast radius of the new privilege to one small,
 auditable component.
 
-Namespace RBAC remains the boundary for who may create VMs and who may
-reference an existing claim from one (claim creation and claim reference are
-unaffected by this VEP's new privilege). It is not the boundary for who may
+Namespace RBAC remains the boundary for who may create VMs, and the webhook
+additionally requires that the VM's author could themselves `update` the
+referenced claim (see [Validation](#validation), rule 7), so the reservation
+controller cannot be used as a confused deputy to modify a claim its caller
+has no access to. Namespace RBAC is not the boundary for who may
 modify `status.reservedFor` — that authority is held by the reservation
 controller's ServiceAccount alone, cluster-wide, as described above.
 
@@ -805,7 +886,7 @@ spec:
             requestName: gpu
 ```
 
-### ResourceClaimTemplate (Beta)
+### ResourceClaimTemplate (Alpha 2)
 
 ```yaml
 apiVersion: kubevirt.io/v1
@@ -830,7 +911,7 @@ spec:
 KubeVirt creates a VM-owned concrete ResourceClaim from `gpu-template` and
 places that concrete claim name into the launcher Pod.
 
-### Managed Claim (Beta)
+### Managed Claim (Alpha 2)
 
 ```yaml
 apiVersion: kubevirt.io/v1
@@ -1016,7 +1097,17 @@ as an externally pluggable component remains an option for a future VEP.
 - Validate that `allocationPolicy` other than `Ephemeral` is rejected for
   standalone VMIs.
 - Validate that `allocationPolicy` defaults to `Ephemeral` and that an
-  `Ephemeral` entry never causes a reservation-controller write.
+  `Ephemeral` entry never causes a reservation to be added.
+- Validate that changing a policy to `Ephemeral`, changing
+  `resourceClaimName`, or removing the entry removes the old reservation.
+- Validate that a VMI with a non-`Ephemeral` policy is rejected unless the
+  request comes from virt-controller's ServiceAccount, and that a user lacking
+  `update` on the referenced claim is rejected.
+- Validate that a second VM claiming the same claim gets a conflict condition.
+- Validate that virt-controller waits for `ReservationEstablished` and times
+  out with a warning event.
+- Validate that no reservation is added until the VM's own launcher Pod is in
+  `reservedFor`.
 - Validate that VM-template claims are not processed as independent VMI
   claims.
 - Validate reservation merge behavior and conflict retries.
@@ -1052,11 +1143,11 @@ With a real DRA driver:
 - restart the VM repeatedly;
 - verify that the claim remains allocated and the device identity is stable;
 - stop and restart with all three allocation policies;
-- verify that KubeVirt's webhook, not an upstream guarantee, is what prevents
-  a second VM from independently requesting the same retained claim — a
-  plain Pod or another workload may still reserve the same claim if nothing
-  in KubeVirt prevents it, since Kubernetes itself permits sharing a claim
-  across up to 256 consumers;
+- verify that when two VMs reference the same claim with a non-`Ephemeral`
+  policy, only the first holds the VM reservation and the second reports a
+  conflict condition. A plain Pod or another workload may still be a
+  consumer of the same claim, since Kubernetes itself permits sharing a claim
+  across up to 256 consumers; this VEP only defines VM-versus-VM behavior;
 - verify that deletion releases the device.
 
 Tests must also cover the allocation-to-reservation race described in
@@ -1072,6 +1163,10 @@ surfaced and retried.
 - 2026-10-07: Revised again to scope alpha to direct claims only, replace
   `persistWhenStopped` with the `allocationPolicy` enum, and move
   `status.reservedFor` management to a dedicated reservation controller.
+- 2026-10-07: Retargeted alpha to v1.11 (direct claims only), since v1.10 is
+  already in progress. ResourceClaimTemplate-backed and VM-scoped managed
+  claims moved to a second alpha milestone in v1.12, aligned with VEP-300
+  alpha in v1.11; beta requires every claim source to have shipped in alpha.
 - Hardware validation (prior `resourceClaimTemplates`-based prototype): Dell
   XE9680 with 4x Samsung PM1745 NVMe drives, 4 VMs each holding a unique NVMe
   device across 10 stop/start cycles and 10 reboot cycles (80/80 total, zero
@@ -1088,7 +1183,7 @@ surfaced and retried.
 
 ## Graduation Requirements
 
-### Alpha
+### Alpha (v1.11)
 
 - [ ] Feature gated behind `PersistentDRAClaims`.
 - [ ] `allocationPolicy` field added to `VirtualMachineInstanceResourceClaim`,
@@ -1096,8 +1191,12 @@ surfaced and retried.
 - [ ] Direct VM-scoped claims supported; no claim objects created, named, or
   owned by KubeVirt.
 - [ ] Dedicated reservation controller deployed with the minimal RBAC
-  described in [RBAC](#rbac), separate from virt-controller's RBAC.
+  described in [RBAC](#rbac), separate from virt-controller's RBAC,
+  including virt-operator install strategy, ServiceAccount, ClusterRole,
+  leader election, and metrics.
 - [ ] VM reservation retained across VMI and launcher Pod replacement.
+- [ ] `ReservationEstablished` condition implemented and honored by
+  virt-controller before intentional stop/restart, with bounded timeout.
 - [ ] Explicit stop behavior implemented for `WhileRunning` and `Persistent`.
 - [ ] VM deletion removes VM reservations before the reservation-protection
   finalizer is removed.
@@ -1109,16 +1208,22 @@ surfaced and retried.
 - [ ] API examples and user documentation are published, including the
   scheduling-pinning consequence of `WhileRunning`/`Persistent`.
 
-### Beta
+### Alpha 2 (v1.12)
 
 - [ ] ResourceClaimTemplate-backed VM-scoped claims supported, including the
   generated-VMI-entry rewrite described in
-  [ResourceClaimTemplates (Beta)](#resourceclaimtemplates-beta).
-- [ ] VEP-300 VM-scoped managed claim integration is implemented, sequenced
-  after VEP-300 merges.
+  [ResourceClaimTemplates (Alpha 2)](#resourceclaimtemplates-alpha-2).
+- [ ] VEP-300 VM-scoped managed claim integration is implemented, building on
+  VEP-300 alpha (v1.11).
 - [ ] Managed claim provisioner capability handling is implemented.
 - [ ] Deterministic, collision-resistant generated claim naming is
   implemented and tested.
+- [ ] Unit and integration tests cover template-backed and managed claims.
+
+### Beta
+
+- [ ] Each claim source (direct, template-backed, managed) has shipped in at
+  least one alpha release.
 - [ ] End-to-end tests cover direct, template-backed, and managed claims.
 - [ ] Allocation-to-reservation race behavior is tested and its duration
   documented.
