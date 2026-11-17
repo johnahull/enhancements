@@ -4,584 +4,377 @@
 
 ### Target releases
 
-- This VEP targets alpha for version: v1.10.0
+- This VEP targets alpha for version: v1.11.0
 - This VEP targets beta for version: TBD
 - This VEP targets GA for version: TBD
 
 ### Release Signoff Checklist
 
-- [ ] (R) Enhancement issue created, which links to VEP dir in [kubevirt/enhancements]
+Items marked with (R) are required *prior to targeting a milestone or release*.
+
+- [x] (R) [Enhancement issue](https://github.com/kubevirt/enhancements/issues/344) created
 - [ ] (R) Alpha target version is explicitly mentioned and approved
 - [ ] (R) Beta target version is explicitly mentioned and approved
 - [ ] (R) GA target version is explicitly mentioned and approved
 
 ## Overview
 
-This VEP introduces VM-scoped persistent ResourceClaims for Kubernetes Dynamic
-Resource Allocation (DRA). Today, KubeVirt supports DRA-provisioned devices
-(GPUs, host devices, network devices) at the VMI level, where ResourceClaims
-are created per-Pod and deleted when the Pod is removed. This means that
-restarting a VM results in a new ResourceClaim and potentially a different
-physical device.
+A VM may be restarted by replacing its VirtualMachineInstance (VMI) and
+virt-launcher Pod. Today, a `ResourceClaimTemplate` referenced by the VMI is
+passed to that Pod. Kubernetes creates a Pod-owned `ResourceClaim`, then deletes
+it with the Pod. The replacement Pod may receive different hardware.
 
-This proposal enables ResourceClaims to be scoped to the VirtualMachine
-lifecycle instead of the VMI/Pod lifecycle. Claims persist across VMI restarts
-and are only released when the VM itself is deleted, ensuring device allocation
-stability.
+This VEP lets a VM request that a template-backed hardware allocation remain
+stable across launcher Pod replacement. An intentional stop releases the
+allocation by default; the VM may instead retain it while stopped.
 
-## Prior Art
+Existing VMs and standalone VMIs keep their current behavior unless the VM
+opts in.
 
-This VEP builds on the work identified in the [GSoC 2024: Persistent Device
-Claims for KubeVirt](https://github.com/kubevirt/community/issues/254) project
-proposal. That issue described the core problem — device allocations are lost
-when VM pods are recreated — and proposed using Kubernetes Dynamic Resource
-Allocation (DRA) ResourceClaims as the persistence mechanism.
+## Motivation and Goals
 
-## Motivation
+A replacement GPU can disrupt guest drivers or device-bound licensing. A
+replacement NVMe device can make guest data unavailable. A replacement NIC can
+change hardware identity. Releasing a device between launcher Pods also lets
+another workload allocate it before the VM restarts.
 
-When using DRA with KubeVirt today, ResourceClaims are scoped to the
-virt-launcher Pod. Each time a VM is restarted (stop/start, reboot, crash
-recovery), the old Pod and its ResourceClaim are deleted, and a new claim is
-created. This causes several problems:
+This VEP aims to:
 
-1. **Data loss for stateful devices**: NVMe drives and other storage devices
-   provisioned via DRA contain persistent data. Losing the device allocation on
-   restart means losing access to that data.
+- Preserve the same allocated DRA device across intentional VMI and launcher
+  Pod replacement.
+- Release the allocation on intentional VM stop by default, while offering an
+  option to keep it through stop/start.
+- Keep existing VM and standalone VMI claim behavior unchanged unless opted in.
+- Release the device allocation when its VM is deleted.
 
-2. **Device instability across reboots**: GPU passthrough users may depend on a
-   specific physical device for driver compatibility, licensing, or workload
-   continuity. A different GPU after a reboot can cause driver failures or
-   license revalidation.
+This VEP does not cover direct `resourceClaimName` references, VEP-300 managed
+claims, eager allocation before a VM starts, or live migration of DRA devices.
+Those sources may adopt the reservation lifecycle in a later proposal.
 
-3. **Network identity loss**: DRA-managed NICs (supported since KubeVirt v1.9
-   via VEP-183) may have MAC addresses tied to DHCP reservations, firewall
-   rules, or monitoring. A different NIC after restart breaks these bindings.
+## API
 
-4. **Allocation failures in busy clusters**: In the window between the old
-   claim being deleted and the new claim being created, another workload can
-   claim the device. This creates a race condition where a VM restart can fail
-   due to resource exhaustion, even though the device was available moments
-   before.
+The existing `VirtualMachineInstanceResourceClaim` entry gains an optional
+`allocationPolicy` field. Non-default policies are valid only in
+`VirtualMachine.spec.template.spec.resourceClaims` for a
+`ResourceClaimTemplate` source. Users declare each claim once:
 
-5. **Inconsistency with other VM-scoped resources**: KubeVirt already supports
-   VM-scoped storage resources that persist across VMI restarts. DRA devices
-   lack an equivalent mechanism, creating an asymmetry in the resource
-   lifecycle model.
+```go
+type ResourceClaimAllocationPolicy string
 
-## Goals
+const (
+    ResourceClaimAllocationPolicyEphemeral    ResourceClaimAllocationPolicy = "Ephemeral"
+    ResourceClaimAllocationPolicyWhileRunning ResourceClaimAllocationPolicy = "WhileRunning"
+    ResourceClaimAllocationPolicyPersistent   ResourceClaimAllocationPolicy = "Persistent"
+)
 
-- Allow DRA device allocations to persist across VM restarts (reboots,
-  stop/start, crash recovery).
-- Ensure the same physical device is re-attached when a VM is restarted.
-- Support all DRA device types (GPUs, host devices, DRA-backed network
-  devices) with a single, device-agnostic mechanism.
-- Allow users to control whether device allocations are released on
-  explicit stop (resource efficiency) or retained (device stability).
+type VirtualMachineInstanceResourceClaim struct {
+    Name                      string                         `json:"name"`
+    ResourceClaimName         *string                        `json:"resourceClaimName,omitempty"`
+    ResourceClaimTemplateName *string                        `json:"resourceClaimTemplateName,omitempty"`
+    AllocationPolicy          *ResourceClaimAllocationPolicy `json:"allocationPolicy,omitempty"`
+}
+```
 
-## Non Goals
+| Policy | Generated claim owner | Launcher replacement | Intentional VM stop |
+|---|---|---|---|
+| Omitted or `Ephemeral` | Pod, as today | New claim and allocation | Released |
+| `WhileRunning` | VM | Keep claim and allocation | Remove VM reservation, then delete claim |
+| `Persistent` | VM | Keep claim and allocation | Keep claim and allocation |
 
-- Eager allocation (creating ResourceClaims before the VM is started).
-  Eager allocation is a potential future enhancement.
-- Migration-aware ResourceClaim handling. Live migration with DRA devices is
-  out of scope for this VEP.
-- Auto-generating ResourceClaims from device declarations. That is the
-  domain of VEP-300 (managed DRA claims), which can build on this VEP's
-  lifecycle mechanisms.
+A VM user adds the policy to the existing template-backed claim entry:
 
-## Definition of Users
+```yaml
+spec:
+  template:
+    spec:
+      resourceClaims:
+      - name: gpu
+        resourceClaimTemplateName: gpu-template
+        allocationPolicy: WhileRunning
+```
 
-- **VM administrators** who manage long-lived VirtualMachines with DRA-provisioned
-  hardware (GPUs, NVMe, host devices).
-- **Platform engineers** who configure DRA drivers and ResourceClaimTemplates
-  for their clusters.
+The VM template is authoritative for ownership and retention. A claim entry
+without a policy continues to pass its template reference to the launcher
+Pod. Switching between `Ephemeral` and VM ownership, or changing the template
+source, requires the VM to be stopped and the old claim to be gone. For a
+stopped `Persistent` VM, first change to `WhileRunning` and wait for claim
+deletion before switching to `Ephemeral` or changing the template source.
+Changing between `WhileRunning` and
+`Persistent` while running changes the next stop's behavior; it does not
+replace the running VMI's claim. Changing from `Persistent` to `WhileRunning`
+while stopped releases the existing allocation.
 
-## User Stories
-
-1. As a VM administrator, I want my VM's GPU assignment to survive restarts so
-   that the guest OS driver stack remains consistent and I don't need to
-   reconfigure the device after each reboot.
-
-2. As a VM administrator, I want my VM's NVMe device to persist across restarts
-   so that data stored on the device is not lost when the VM is stopped and
-   restarted.
-
-3. As a VM administrator, I want my VM to reliably restart in a busy cluster
-   without risking allocation failure because another workload grabbed my
-   device during the restart window.
-
-4. As a VM administrator, I want my VM's DRA-managed NIC to keep the same
-   MAC address across restarts so that DHCP reservations, firewall rules,
-   and monitoring remain valid. (DRA-backed network devices are supported
-   since KubeVirt v1.9 via VEP-183.)
-
-5. As a platform engineer, I want a single mechanism that works for all
-   DRA-managed device types (GPUs, NVMe, DRA-backed NICs) without needing
-   device-specific configuration in KubeVirt.
-
-## Repos
-
-- `kubevirt/kubevirt` — API types, VM controller, webhook validation, RBAC
+The field is in a type shared with standalone VMIs because VM templates embed
+the VMI spec. Admission rejects VM-owned policies on standalone VMIs. A
+separate VM-level template list would require users to repeat the logical
+claim name and template source in two places.
 
 ## Design
 
-### API Changes
+### Claim creation and launcher references
 
-A new type `ResourceClaimTemplateEntry` and a new field `resourceClaimTemplates`
-on `VirtualMachineSpec`:
+For `WhileRunning` and `Persistent` entries, KubeVirt reads the named
+`ResourceClaimTemplate` in the VM's namespace and lazily creates one concrete
+`ResourceClaim` before creating the VMI. It copies the template's claim spec,
+sets the VM as controller owner, and records the logical claim name and source
+on the generated claim. The claim persists across launcher replacement. It is
+deleted at explicit stop for `WhileRunning`; `Persistent` retains both
+the claim and its allocation through stop/start.
 
-```go
-// ResourceClaimTemplateEntry defines a ResourceClaim that should be created
-// from a ResourceClaimTemplate and bound to this VirtualMachine's lifecycle.
-type ResourceClaimTemplateEntry struct {
-    // Name is the logical name used to match this entry to
-    // spec.template.spec.resourceClaims[].name in the VMI template.
-    // +kubebuilder:validation:MinLength=1
-    Name string `json:"name"`
-    // ResourceClaimTemplateName is the name of a ResourceClaimTemplate
-    // object in the same namespace to create the ResourceClaim from.
-    // +kubebuilder:validation:MinLength=1
-    ResourceClaimTemplateName string `json:"resourceClaimTemplateName"`
-    // PersistWhenStopped controls whether the ResourceClaim is retained
-    // when the VM is explicitly stopped (runStrategy set to Halted or
-    // stop API called). When nil or false (the default), the claim is
-    // deleted on stop to free the device for other workloads, and
-    // re-created on the next start. When true, the claim persists for
-    // the VM's entire lifetime. Claims always persist across reboots
-    // regardless of this setting.
-    // +optional
-    PersistWhenStopped *bool `json:"persistWhenStopped,omitempty"`
-}
+The generated name is deterministic and includes a hash of the VM name and
+logical claim name. KubeVirt truncates the readable prefix to fit the claim
+name limit while retaining the hash suffix. A plain concatenation can collide
+when names contain hyphens or exceed the limit. Before reusing a claim with
+the expected name, KubeVirt verifies its
+VM owner UID and logical claim identity. It reports a conflict instead of
+adopting or overwriting another claim.
 
-type VirtualMachineSpec struct {
-    // ... existing fields ...
+KubeVirt rewrites the generated VMI's entry from `resourceClaimTemplateName`
+to the concrete `resourceClaimName` and clears `allocationPolicy` on that VMI
+entry. The launcher Pod references the concrete name, not the template. The
+VMI rewrite is also needed by virt-launcher: it reads DRA device metadata
+from a path determined by the VMI claim source, which must match the Pod's
+concrete claim reference. The VM template remains authoritative for the
+policy. Standalone VMIs and VM entries with an omitted or `Ephemeral` policy
+retain the existing Pod-owned template flow.
 
-    // resourceClaimTemplates is a list of ResourceClaims that should be
-    // created from ResourceClaimTemplates and are tied to the
-    // VirtualMachine's lifecycle.
-    // +kubebuilder:validation:MaxItems:=256
-    // +listType=map
-    // +listMapKey=name
-    // +optional
-    ResourceClaimTemplates []ResourceClaimTemplateEntry `json:"resourceClaimTemplates,omitempty"`
-}
+### Allocation reservation
+
+Kubernetes allocates the claim while scheduling the first launcher Pod and
+adds that Pod to `status.reservedFor`. A dedicated KubeVirt reservation
+controller adds a second consumer reference for the VM:
+
+```text
+{apiGroup: kubevirt.io, resource: virtualmachines, name: <vm>, uid: <vm UID>}
 ```
 
-### Kubernetes DRA Background: `status.reservedFor`
+The controller adds this reference only after it sees a non-nil allocation
+and the VM's own launcher Pod in `reservedFor`. This prevents attaching the VM
+to an allocation made for an unrelated consumer. It preserves other consumer
+references and retries status-update conflicts. Kubernetes removes the old
+Pod's reference when that Pod is done; it leaves the VM reference alone. As
+long as the VM reference remains, Kubernetes does not deallocate the claim.
+The replacement Pod is then scheduled against the same allocation.
 
-Kubernetes DRA ResourceClaims have a standard `status.reservedFor` field
-that lists which entities are currently using a claim. The DRA resource
-controller only deallocates a claim when this list is **empty**. This is
-an existing Kubernetes API — no upstream changes are needed.
+`ReservationEstablished` is true only when every current VM template entry
+with a VM-owned policy resolves to a claim owned by the current VM UID, that
+claim has a non-nil allocation, and its `reservedFor` contains the VM UID.
+Initial establishment also requires the current launcher Pod's reservation.
+The condition is invalidated when the VM entry, claim UID, or allocation
+changes, or the VM reference disappears. Before an intentional restart,
+virt-controller checks the current claims again; a stale condition cannot
+authorize launcher deletion.
 
-The field accepts any Kubernetes resource type, not just pods:
+The reservation controller owns all KubeVirt writes to `status.reservedFor`.
+Claim creation and VMI rendering remain separate from that privilege. The
+controller watches VMs, VMIs, Pods, and claims; reconciles desired VM entries
+and existing VM reservations; and removes a reservation on explicit stop,
+release from `Persistent` to `WhileRunning` while stopped, or VM deletion.
+Claim deletion follows reservation removal. Admission blocks source changes
+and removal of VM ownership until that cleanup completes.
+Only a matching VM UID may retain or delete a generated claim.
 
-```go
-type ResourceClaimConsumerReference struct {
-    APIGroup string  // e.g., "kubevirt.io"
-    Resource string  // e.g., "virtualmachines"
-    Name     string
-    UID      types.UID
-}
-```
+### Restarts, stops, and deletion
 
-When a pod references a claim, the scheduler adds the pod to `reservedFor`.
-When the pod is deleted, the kubelet removes it. If no other consumers
-remain, the DRA controller deallocates the claim.
+A guest reboot within an existing launcher Pod does not change its Pod
+reservation. `virtctl restart`, automatic VMI recovery, and launcher Pod
+replacement do. The VM reservation survives these replacements for both
+VM-owned policies. `virtctl restart` is encoded as paired `StopRequest` and
+`StartRequest` actions. The pair is a restart, not an explicit stop: under
+every run strategy, virt-controller must establish and recheck the VM
+reservation before acting on the stop request, and must skip claim cleanup
+for that pair. If the reservation cannot be established, it reports the
+problem and leaves the old launcher in place. Unexpected Pod loss during the
+initial allocation-to-reservation gap remains an alpha limitation.
 
-This VEP uses `reservedFor` to add the VM as a consumer alongside the pod.
-When the pod is deleted (stop or reboot), the VM entry remains, keeping the
-allocation alive. No anchor pods, sidecar pods, or upstream API changes are
-required.
+| Transition | `WhileRunning` | `Persistent` |
+|---|---|---|
+| Guest reboot in the same launcher | Keep Pod and VM reservations | Keep Pod and VM reservations |
+| `virtctl restart`, automatic recovery under `Always` or `RerunOnFailure`, or launcher replacement | Keep claim and VM reservation | Keep claim and VM reservation |
+| `virtctl stop`, `runStrategy: Halted`, or a stopped `Manual` VM | Remove VM reservation, then delete claim | Keep claim and VM reservation |
+| Completion under `Once`, or successful completion under `RerunOnFailure` with no replacement | Remove VM reservation, then delete claim | Keep claim and VM reservation |
+| VM deletion | Remove VM reservation, then delete claim | Remove VM reservation, then delete claim |
 
-### Controller Behavior
+For `WhileRunning`, cleanup reconciles the VM's desired state and terminal
+VMI status, including when the VMI is already absent. It does not depend on
+a particular `stopVMI` call path. A stop waits until the old VMI and launcher
+Pod can no longer use the claim, then removes the VM reservation and deletes
+the claim. The next start creates a new claim from the current template and
+may get different hardware. A restart is never processed as a stop merely
+because its VMI is temporarily absent. The transition mapping must be
+confirmed with sig-compute before alpha.
 
-The VM controller manages ResourceClaims following the same pattern as
-`dataVolumeTemplates`:
+A reservation on a VM-owned claim requires deletion cleanup: Kubernetes does
+not prune unknown consumer types, and its allocation finalizer can keep the
+claim in `Terminating` while a VM reference remains. The reservation
+controller adds a VM finalizer while reservations exist. On VM deletion it
+removes each VM reference, then removes its VM finalizer; Kubernetes can then
+deallocate and garbage-collect the VM-owned claim. The controller also removes
+orphaned references whose VM is missing or has a different UID. Disabling the
+feature gate must not disable this cleanup for already-created reservations.
 
-1. **Claim creation** (`handleResourceClaims`): Called during `startVMI()`,
-   before the VMI is created. For each entry in `resourceClaimTemplates`:
-   - Derives the claim name as `<vm-name>-<entry-name>` (validated at admission
-     time to not exceed 63 characters — the Kubernetes name length limit)
-   - Checks if the ResourceClaim already exists in the informer cache
-   - If not, looks up the ResourceClaimTemplate, creates the ResourceClaim with
-     the VM as owner (via `OwnerReference`), and records controller expectations
+### Scheduling and migration
 
-2. **VMI setup** (`SetupVMIFromVM`): When constructing the VMI from the VM
-   template, any `resourceClaims` entry that has a `resourceClaimTemplateName`
-   matching a `resourceClaimTemplates` entry is rewritten to use a direct
-   `resourceClaimName` pointing to the pre-created claim. This ensures the Pod
-   spec references the persistent claim rather than a template.
+A retained node-local allocation pins future launcher Pods to the node in the
+allocation's node selector. If that node is unavailable, the replacement Pod
+remains Pending until the node returns or the allocation is explicitly
+released. This VEP does not make DRA devices live-migratable. VMs using a
+VM-owned DRA claim must have `VirtualMachineInstanceIsMigratable=False` with
+a DRA reason. Migration creation admission must reject it, and automatic
+evacuation must respect the same condition. This applies regardless of device
+type until a migration design provides the same device guarantees.
 
-3. **Lifecycle management**: ResourceClaim informer event handlers
-   (`add`/`update`/`delete`) resolve owner references back to the VM and
-   re-enqueue it for reconciliation, using the expectations pattern to prevent
-   duplicate operations.
+The claim spec is immutable. Updating the `ResourceClaimTemplate` does not
+change an existing VM-owned claim. To request a different device or apply a
+new template spec, stop the VM. For `WhileRunning`, wait for the old claim
+to be deleted, then start the VM. For `Persistent`, change it to
+`WhileRunning` while stopped, wait for reservation removal and claim deletion,
+restore `Persistent` if continued retention is desired, then start. This
+also lets a user manually reallocate a stopped VM without deleting the VM.
+If the device's node is unavailable while the VM is meant to run,
+explicitly stop and release the claim before starting again. KubeVirt does
+not silently reallocate on another node. Deleting an allocated claim while
+its VM reservation remains leaves it in `Terminating`.
 
-4. **Allocation preservation** (`ensureVMInClaimReservedFor`): Called early
-   in every VM reconcile, before run strategy decisions. For claims with
-   `persistWhenStopped: true`, the controller checks if the claim is
-   allocated. Once allocated, if the VM is not in the claim's
-   `status.reservedFor`, the controller adds a `ResourceClaimConsumerReference`
-   for the VM via the `resourceclaims/binding` subresource. This is
-   idempotent — subsequent reconciles skip claims that already have the VM
-   in `reservedFor`. The VM entry keeps the allocation alive when the pod
-   is deleted, ensuring the same physical device on next start.
+## Validation and Security
 
-5. **Stop-time cleanup** (`cleanupNonPersistentResourceClaims`): When a VM
-   is explicitly stopped, the controller deletes ResourceClaims for entries
-   where `persistWhenStopped` is false (the default), freeing the devices
-   for other workloads. Claims with `persistWhenStopped: true` are retained
-   with their allocation intact. On the next start, missing claims are
-   re-created from their templates.
+The `PersistentDRAClaims` gate is disabled by default during alpha. Admission
+accepts new `WhileRunning` and `Persistent` entries only in a VM's VMI template
+while the gate is enabled. Direct `resourceClaimName` references and standalone
+VMIs cannot opt in. The template must be in the VM's namespace. Claim entry
+names must be unique and have exactly one source. Generated VMIs have a
+resolved direct reference and no policy; standalone VMIs cannot request VM
+ownership by supplying a VM owner reference. Admission rejects
+switching between `Ephemeral` and a VM-owned policy, or changing the template
+source, while a VMI exists. A stopped VM may change `Persistent` to
+`WhileRunning` to release the claim, including after the gate is disabled.
+Admission rejects changing the template source or switching to `Ephemeral`
+while the old VM-owned claim still exists. Reconciliation must finish deleting
+it before reusing its name for a different template source.
 
-6. **VM deletion cleanup**: Before removing the VM finalizer, the controller
-   removes the VM from `reservedFor` on all persistent claims. This allows
-   the DRA resource controller to deallocate the devices. The claims are
-   then garbage-collected via owner references.
+Updating `status.reservedFor` requires `resourceclaims/status` update and, on
+Kubernetes versions with granular DRA status authorization,
+`resourceclaims/binding` update. The latter is a synthetic cluster-wide
+permission. It belongs to a dedicated, auditable reservation controller
+ServiceAccount, not virt-controller. Claim creation, template reads, and
+claim deletion use a separate identity without binding permission. The
+reservation controller changes only the VM's own consumer reference, reports
+write failures, and retries them. A metric and VM condition expose orphaned
+or stuck reservations.
 
-7. **Garbage collection**: ResourceClaims have the VM as their controller owner
-   reference. Kubernetes garbage collection automatically deletes them when the
-   VM is deleted.
+Kubernetes upstream confirmed that third-party VM references in
+`reservedFor` are supported, as [recorded in the earlier VEP review](https://github.com/kubevirt/enhancements/pull/345#discussion_r3805771749).
+Kubernetes preserves non-Pod entries in its claim controller, with existing
+controller tests for that behavior. KubeVirt must still test reservation
+creation, launcher replacement, stop, and deletion against supported
+Kubernetes versions. This proposal requires no Kubernetes API or scheduler
+change.
 
-### Claim Lifecycle
+A VM reservation keeps the allocation but does not make the claim exclusive:
+Kubernetes currently permits another Pod in the namespace to reference and
+reserve the same named claim. This design assumes namespace users with Pod
+creation rights are trusted to use one another's claims. Environments that
+need exclusive VM use must enforce Pod claim references with a separate
+admission policy. KubeVirt's VM controller cannot provide that boundary.
 
-The default behavior (`persistWhenStopped: false`) releases devices on stop so
-they are available to other workloads:
-
-```
-VM created (Halted)     → no claims created
-VM started              → claims created, VMI created referencing them
-VM rebooted             → claims persist, VMI recreated reusing them
-VM stopped              → VMI deleted, claims DELETED (devices freed)
-VM restarted            → new claims created (may get different device)
-VM deleted              → any remaining claims garbage-collected via owner ref
-```
-
-With `persistWhenStopped: true`, claims persist for the VM's entire lifetime.
-The VM is added to `status.reservedFor` on the claim, which prevents the DRA
-resource controller from deallocating when the pod is deleted:
-
-```
-VM created (Halted)     → no claims created
-VM started              → claims created, scheduler allocates, VM added to reservedFor
-VM rebooted             → pod removed from reservedFor, VM entry keeps allocation alive
-VM stopped              → pod deleted, VM stays in reservedFor, allocation PRESERVED
-VM restarted            → claims already allocated with same device, new pod added
-VM deleted              → VM removed from reservedFor, claims deallocated and GC'd
-```
-
-Use `persistWhenStopped: true` for devices with persistent state (NVMe),
-identity-bound licensing (GPU tied to PCI address), or network identity
-(NIC with DHCP reservation). Use the default for devices where resource
-efficiency matters more than device stability.
-
-Validated on Dell XE9680 with 4x Samsung PM1745 NVMe drives: 4 VMs each
-holding a unique NVMe device across 10 stop/start cycles and 10 reboot
-cycles (80/80 total, zero device swaps).
-
-### Manual Reallocation
-
-If a user needs to force a different device allocation on a **stopped** VM
-(e.g., replacing failed hardware, changing NUMA placement), they can
-delete the claim directly. Claims should only be deleted while the VM is
-stopped — deleting a claim on a running VM has no effect until the next
-start, since the running pod already has the device allocated.
-
-```
-kubectl delete resourceclaim my-vm-nvme-claim
-virtctl start my-vm   # controller recreates claim, scheduler allocates fresh
-```
-
-The controller's `handleResourceClaims` recreates missing claims on start.
-The scheduler allocates from the available device pool, which may assign a
-different physical device.
-
-For beta, a `reallocateOnNextStart` field on `ResourceClaimTemplateEntry` is
-a candidate if users need a single-step API. For alpha, the manual approach
-is sufficient — reallocation is an exceptional operation.
-
-### Webhook Validation
-
-The validating webhook (`validateResourceClaimTemplates`) enforces:
-
-- `PersistentDRAClaims` feature gate must be enabled
-- No duplicate `name` entries
-- Both `name` and `resourceClaimTemplateName` are required
-- Each entry must have a matching `spec.template.spec.resourceClaims[]` entry
-  by name
-- The derived claim name (`<vm-name>-<entry-name>`) must not exceed 63
-  characters (the Kubernetes object name length limit)
-
-### RBAC
-
-The virt-controller service account requires:
-- `resourceclaims`: get, list, watch, create, delete
-- `resourceclaims/binding`: patch
-- `resourceclaimtemplates`: get, list, watch
-
-The `delete` verb is needed for stop-time cleanup of claims where
-`persistWhenStopped` is false. The `resourceclaims/binding` patch
-permission is needed to add/remove the VM from `status.reservedFor`.
-The `/binding` subresource is the Kubernetes-canonical way to modify
-`reservedFor`, matching the RBAC pattern used by kube-controller-manager
-for StatefulSet volume claims.
-
-### Live Migration
-
-VMs with `persistWhenStopped: true` ResourceClaims cannot be live-migrated.
-DRA device allocations are node-specific — the allocated device exists on the
-node where the claim was bound. The VMI will have a `HostDeviceNotLiveMigratable`
-condition set by default for any VM with DRA host device passthrough, which
-blocks migration. Users who need migration should use VMI-scoped claims (the
-existing pod-level DRA flow) rather than VM-scoped persistent claims.
-
-### Security Implications
-
-The virt-controller service account has `patch` permission on
-`resourceclaims/binding`. This is equivalent to the privileges held by
-kube-scheduler and kube-controller-manager for managing pod allocations.
-The VM controller is trusted to manage `reservedFor` because:
-- It only modifies claims it owns (enforced via OwnerReference)
-- It follows the same reservation lifecycle as StatefulSets
-- Admission webhooks prevent unauthorized claim creation
-
-### Quota Implications
-
-When `persistWhenStopped: true`, the VM holds a device allocation even when
-stopped. This does not count against pod-based resource quotas, but does count
-against cluster-wide device capacity reported via ResourceSlices. Cluster admins
-should monitor ResourceClaim allocations separately from pod quotas when
-persistent claims are in use.
-
-## API Examples
-
-### VM with persistent GPU claim
-
-```yaml
-apiVersion: kubevirt.io/v1
-kind: VirtualMachine
-metadata:
-  name: vm-dra-pgpu
-spec:
-  runStrategy: Halted
-  resourceClaimTemplates:
-  - name: pgpu-resource-claim
-    resourceClaimTemplateName: pgpu-resource-claim-tmpl
-  template:
-    spec:
-      domain:
-        devices:
-          gpus:
-          - claimName: pgpu-resource-claim
-            name: example-gpu
-            requestName: pgpu
-        memory:
-          guest: 1024M
-      resourceClaims:
-      - name: pgpu-resource-claim
-        resourceClaimTemplateName: pgpu-resource-claim-tmpl
-      volumes:
-      - containerDisk:
-          image: registry:5000/kubevirt/fedora-with-test-tooling-container-disk:devel
-        name: containerdisk
-```
-
-### Comparison: VMI-scoped (before) vs VM-scoped (after)
-
-**Before (VMI-scoped, existing behavior):**
-ResourceClaim is created per-Pod by kubelet. Deleted when Pod is removed.
-VM restart = new claim = potentially different device.
-
-**After (VM-scoped, this VEP):**
-ResourceClaim is created by VM controller with VM as owner. Persists across
-VMI restarts. VM restart = same claim = same device allocation.
-
-### VM with mixed persistence policies
-
-NVMe persists when stopped (data preservation). GPU is released on stop
-(resource efficiency) and re-allocated on next start.
-
-```yaml
-apiVersion: kubevirt.io/v1
-kind: VirtualMachine
-metadata:
-  name: vm-multi-device
-spec:
-  runStrategy: Always
-  resourceClaimTemplates:
-  - name: gpu-claim
-    resourceClaimTemplateName: gpu-template
-    # default: persistWhenStopped: false — GPU freed on stop
-  - name: nvme-claim
-    resourceClaimTemplateName: nvme-template
-    persistWhenStopped: true  # NVMe kept across stop/start
-  template:
-    spec:
-      domain:
-        devices:
-          gpus:
-          - claimName: gpu-claim
-            name: passthrough-gpu
-            requestName: pgpu
-          hostDevices:
-          - claimName: nvme-claim
-            name: fast-storage
-            requestName: nvme
-        memory:
-          guest: 4096M
-      resourceClaims:
-      - name: gpu-claim
-        resourceClaimTemplateName: gpu-template
-      - name: nvme-claim
-        resourceClaimTemplateName: nvme-template
-```
+There is a short gap after the scheduler allocates a claim and before the VM
+reservation can be added: Kubernetes rejects a `reservedFor` entry on an
+unallocated claim. Gating intentional restart protects that operation, but
+unexpected launcher loss or terminal Pod status in this interval may release
+the allocation, even if the Pod object has a finalizer. The alpha guarantee
+starts once `ReservationEstablished` is true. This gap must be measured and
+documented; closing it completely requires a Kubernetes-side reservation
+mechanism before first allocation.
 
 ## Alternatives
 
-### 1. Eager allocation with per-entry policy
+The original `VirtualMachineSpec.resourceClaimTemplates` list follows
+`dataVolumeTemplates`, but requires the user to repeat each claim's logical
+name and template source alongside the VMI template. [Reviewers objected to
+the parallel API](https://github.com/kubevirt/enhancements/pull/345#discussion_r3791748826). The single-entry policy avoids that duplication.
 
-Instead of creating claims only at start time, create them as soon as the VM
-object is created. This would guarantee device availability even for halted VMs.
-A per-entry `allocationMode: Eager | Lazy` field would allow users to choose
-the behavior per device — eager for NVMe (data preservation), lazy for GPUs
-(efficient utilization).
+A generic Kubernetes API could manage claims across Pod replacement, but the
+VM lifecycle policy and device identity requirement are specific here. This
+VEP uses existing DRA primitives for template-backed VMs and leaves a generic
+workload design to Kubernetes.
 
-**Rejected for initial implementation** because it adds API complexity. The lazy
-approach matches the existing `dataVolumeTemplates` pattern and is correct for
-the common case. Eager allocation can be added as a follow-up enhancement if
-reviewers or users identify a strong need.
+An external controller selected by a VM label would make opt-in apply to the
+whole VM. One VM may need to retain an NVMe allocation while stopped but
+release a GPU allocation; a label would need separate configuration mapping
+each claim to a retention policy. That mapping would duplicate the claim
+references in the VM template and could drift from them. The per-claim field
+keeps the policy with its reference. A dedicated reservation controller still
+isolates `reservedFor` write permission, while the feature gate controls new
+opt-ins. Cleanup must remain active for existing claims even if the gate is
+later disabled, so removing an add-on controller at that point would strand
+reservations.
 
-### 2. Annotation-based approach
+## Compatibility
 
-Use annotations on the VM to signal which ResourceClaims should persist, rather
-than adding a new spec field.
-
-**Rejected** because annotations are unstructured, unvalidated, and not
-discoverable via the API schema. A first-class spec field provides type safety,
-webhook validation, and clear documentation.
-
-### 3. Finalizer-based claim retention
-
-Instead of creating claims owned by the VM, intercept Pod deletion and transfer
-ownership of existing pod-scoped claims to the VM using finalizers.
-
-**Rejected** because it introduces complex lifecycle coordination between the
-VM controller and kubelet's claim management. The pre-creation approach is
-simpler and follows the established `dataVolumeTemplates` pattern.
-
-### 4. PVCs instead of persistent ResourceClaims
-
-For NVMe storage, use PersistentVolumeClaims via a CSI driver instead of
-DRA ResourceClaims.
-
-**Rejected** because PVCs are a storage abstraction — they don't cover GPUs,
-DRA-backed NICs, FPGAs, or other non-storage devices. DRA ResourceClaims are the
-Kubernetes-standard API for dynamic device allocation, and they carry device
-metadata (NUMA node, PCIe topology, driver attributes) that PVCs lack. Even
-for NVMe, DRA VFIO passthrough gives direct hardware access without the
-filesystem/block driver overhead that CSI imposes.
-
-### 5. Dual declaration of resourceClaimTemplates
-
-The user declares `resourceClaimTemplates` entries on the VM spec **and**
-references them in `spec.template.spec.resourceClaims` on the VMI template.
-This follows the established `dataVolumeTemplates` pattern, where the VM spec
-declares what to create and the VMI template declares what to consume. The
-webhook validates that every VM-level entry has a matching VMI-level entry.
-The `SetupVMIFromVM` controller logic rewrites template references to direct
-claim name references before VMI creation, so the VMI never sees the
-template — only the concrete claim.
-
-## Scalability
-
-- Each VM with `resourceClaimTemplates` creates one ResourceClaim per entry.
-  The maximum is capped at 256 entries per VM via kubebuilder validation.
-- ResourceClaim informers watch cluster-wide, consistent with other KubeVirt
-  informers (PVCs, DataVolumes). This adds two new informers to the
-  virt-controller.
-- Controller expectations prevent duplicate API calls during reconciliation.
-- No additional API calls are made for VMs that do not use
-  `resourceClaimTemplates`.
-
-## Update/Rollback Compatibility
-
-- The `resourceClaimTemplates` field is optional. Existing VMs without the
-  field are unaffected.
-- On rollback, orphaned ResourceClaims (created by the new controller) will
-  remain until manually deleted or until the VM is deleted (owner reference GC
-  still works regardless of the controller version).
-- The feature is gated behind a dedicated `PersistentDRAClaims` feature gate
-  (alpha, disabled by default). The webhook rejects `resourceClaimTemplates`
-  when the gate is off.
+Existing VMs and standalone VMIs remain unchanged when `allocationPolicy` is
+omitted. If the feature gate is disabled after opted-in VMs exist, running
+VMIs may continue and guest-reboot, but KubeVirt does not create a replacement
+VMI or new claim for them. Intentional restart is rejected; unexpected loss
+leaves the VM Pending with a condition until the gate is re-enabled. Existing
+VMs may remove or weaken a policy to release a claim; new opt-ins are rejected.
+Stop, deletion, and orphan cleanup remain active so reservations can be
+released. A downgrade to a KubeVirt version without reservation cleanup may
+leave VM references that hold claims
+and allocations indefinitely; the upgrade and rollback procedure must remove
+those references before downgrading. The original VEP's top-level
+`VirtualMachineSpec.resourceClaimTemplates` and `persistWhenStopped` are
+replaced by the single-entry policy. Both VM-owned policies require a VM
+reservation; claim ownership alone does not preserve the allocation.
 
 ## Functional Testing Approach
 
-### Unit Tests (implemented)
-
-- `SetupVMIFromVM` correctly rewrites `resourceClaimTemplateName` to
-  `resourceClaimName` for matching entries
-- Non-matching entries and direct `resourceClaimName` references are preserved
-- `CreateResourceClaimManifest` produces correct ownership, naming, and labels
-- Multiple and mixed (direct + template) claims are handled correctly
-
-### Integration Tests (planned)
-
-- VM with `resourceClaimTemplates` creates ResourceClaims on start
-- ResourceClaims are deleted on stop when `persistWhenStopped: false` (default)
-- ResourceClaims persist on stop when `persistWhenStopped: true`
-- ResourceClaims persist across reboots regardless of `persistWhenStopped`
-- ResourceClaims are re-created on start after a stop (default behavior)
-- ResourceClaims are reused on start when they already exist (`persistWhenStopped: true`)
-- ResourceClaims are garbage-collected when VM is deleted
-- Webhook rejects invalid configurations (missing template, duplicate names,
-  name too long, feature gate disabled)
-
-### E2E Tests (planned)
-
-- Full lifecycle test with a real DRA driver: create VM, start, verify device,
-  stop, restart, verify same device allocation
-- Requires a cluster with DRA support and a DRA driver installed
-- Hardware validation performed on Dell R7725 with Samsung PM1745 NVMe drives
-  via dra-driver-nvme VFIO passthrough (5 restart cycles, 2 VMs, 3 claims,
-  0 failures)
-
-## References
-
-- [GSoC 2024: Persistent Device Claims for KubeVirt](https://github.com/kubevirt/community/issues/254) — Original project proposal by Alice Frosi, Victor Toso de Carvalho, and Luboslav Pivarc that identified the persistent device claim problem and proposed using DRA as the solution
-- [Kubernetes DRA documentation](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
-- [Kubernetes DRA enhancement proposal](https://github.com/kubernetes/enhancements/issues/3063)
-- [KubeVirt host devices user guide](https://kubevirt.io/user-guide/virtual_machines/host-devices/)
-
-## Implementation History
-
-- 2024-02: Problem identified in [kubevirt/community#254](https://github.com/kubevirt/community/issues/254) (GSoC 2024)
-- 2026-05: Initial implementation and hardware validation. PR: [kubevirt/kubevirt#17957](https://github.com/kubevirt/kubevirt/pull/17957)
+- Unit tests: policy validation; generated claim naming and owner UID checks;
+  VMI claim rewrite; VM/Pod reservation reconciliation; stop policy; deletion
+  and orphan cleanup; gate-disabled cleanup; claim-specific restart gating;
+  paired restart requests; terminal `Once` and `RerunOnFailure` cleanup;
+  and status conflict retries.
+- Integration tests: template claim creation before VMI; same claim UID and
+  allocation across `virtctl restart`; deletion on `WhileRunning` stop;
+  retained claim and allocation on `Persistent` stop; stale condition blocks
+  restart; source change is rejected until a `Persistent` claim is released;
+  gate disablement leaves replacement Pending; unavailable node leaves
+  replacement Pending; and VM deletion removes reservations and claims.
+- End-to-end tests with a DRA driver: confirm physical device identity across
+  launcher replacements under both policies and across stop/start only for
+  `Persistent`. Confirm `WhileRunning` releases its allocation on stop. Exercise
+  node loss, explicit release and recreation, rejected migration and
+  evacuation, and controller restart. Measure the allocation-to-reservation
+  interval.
 
 ## Graduation Requirements
 
 ### Alpha
 
-- [x] Feature gated behind dedicated `PersistentDRAClaims` feature gate
-- [x] `ResourceClaimTemplateEntry` API type and `VirtualMachineSpec.ResourceClaimTemplates` field
-- [x] VM controller creates and manages ResourceClaims from templates
-- [x] `SetupVMIFromVM` rewrites template references to direct name references
-- [x] Webhook validation for `resourceClaimTemplates`
-- [x] Unit tests for controller logic, rewrite behavior, and validation
-- [x] Hardware validation with NVMe VFIO passthrough
-- [ ] Documentation and example manifests
+- [ ] API and feature gate added without changing existing VMs or VMIs.
+- [ ] Template-backed VM claims and generated-VMI rewrite implemented.
+- [ ] Dedicated reservation controller and cleanup deployed with isolated RBAC.
+- [ ] Intentional restart waits for `ReservationEstablished`.
+- [ ] Unit and integration tests cover allocation identity, run strategies,
+      and both stop modes.
+- [ ] User documentation explains node pinning, reallocation, and the initial
+  reservation gap.
 
 ### Beta
 
-- [ ] Integration tests covering full VM lifecycle with persistent claims
-- [ ] E2E tests with a real DRA driver
-- [ ] Feedback from alpha users incorporated
-- [ ] Consider eager allocation policy based on user feedback
-- [ ] Documentation in kubevirt.io user guide
+- [ ] End-to-end device identity tests run with a real DRA driver.
+- [ ] Upgrade, rollback, controller restart, and orphan recovery are tested.
+- [ ] The reservation gap and cleanup behavior meet reliability requirements.
+- [ ] Scheduling and migration restrictions are documented in the user guide.
 
 ### GA
 
-- [ ] Stable across multiple releases
-- [ ] No outstanding bugs or behavioral issues
-- [ ] Broad user adoption and positive feedback
-- [ ] Live migration interaction documented (claims block migration by design)
-- [ ] Upgrade/downgrade testing
+- [ ] API and lifecycle semantics are stable across multiple releases.
+- [ ] No known allocation leaks or unintended device changes remain.
+
+## References
+
+- [VEP-344 issue](https://github.com/kubevirt/enhancements/issues/344)
+- [VEP-10: DRA Devices](https://github.com/kubevirt/enhancements/tree/main/veps/sig-compute/10-dra-devices)
+- [Kubernetes DRA](https://kubernetes.io/docs/concepts/resource-management/dynamic-resource-allocation/)
+- [Prior implementation PR](https://github.com/kubevirt/kubevirt/pull/17957)
+- [GSoC 2024: Persistent Device Claims for KubeVirt](https://github.com/kubevirt/community/issues/254)
