@@ -33,10 +33,16 @@ opts in.
 
 ## Motivation and Goals
 
-A replacement GPU can disrupt guest drivers or device-bound licensing. A
-replacement NVMe device can make guest data unavailable. A replacement NIC can
-change hardware identity. Releasing a device between launcher Pods also lets
-another workload allocate it before the VM restarts.
+Consider a VM whose guest writes a filesystem to a passed-through NVMe device.
+If launcher replacement selects another same-model drive, the guest may not
+find its data or may access the wrong disk. Retaining the first allocation
+prevents another workload from taking that drive between launcher Pods.
+[KubeVirt documents unpredictable assignment of matching NVMe devices](https://kubevirt.io/user-guide/compute/host-devices/#nvme-pci-passthrough)
+for its legacy device-plugin path; this is an analogous identity risk, not a
+documented DRA incident. A GPU application configured for a particular
+[device UUID](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/environment-variables.html#cuda-visible-devices)
+could also require reconfiguration after substitution, but that depends on
+the application.
 
 This VEP aims to:
 
@@ -81,17 +87,29 @@ type VirtualMachineInstanceResourceClaim struct {
 | `WhileRunning` | VM | Keep claim and allocation | Remove VM reservation, then delete claim |
 | `Persistent` | VM | Keep claim and allocation | Keep claim and allocation |
 
-A VM user adds the policy to the existing template-backed claim entry:
+A VM user adds the policy to the existing template-backed claim entry. This
+VM excerpt assumes the `ResourceClaimTemplate` has a device request named
+`nvme`:
 
 ```yaml
 spec:
   template:
     spec:
+      domain:
+        devices:
+          hostDevices:
+          - name: nvme
+            claimName: nvme
+            requestName: nvme
       resourceClaims:
-      - name: gpu
-        resourceClaimTemplateName: gpu-template
-        allocationPolicy: WhileRunning
+      - name: nvme
+        resourceClaimTemplateName: nvme-template
+        allocationPolicy: Persistent
 ```
+
+`Persistent` keeps this data-bearing device through explicit stop/start.
+`WhileRunning` retains the allocation across launcher replacement but releases
+it on explicit stop; a later start may receive a different device.
 
 The VM template is authoritative for ownership and retention. A claim entry
 without a policy continues to pass its template reference to the launcher
@@ -293,20 +311,36 @@ The original `VirtualMachineSpec.resourceClaimTemplates` list follows
 name and template source alongside the VMI template. [Reviewers objected to
 the parallel API](https://github.com/kubevirt/enhancements/pull/345#discussion_r3791748826). The single-entry policy avoids that duplication.
 
-A generic Kubernetes API could manage claims across Pod replacement, but the
-VM lifecycle policy and device identity requirement are specific here. This
-VEP uses existing DRA primitives for template-backed VMs and leaves a generic
-workload design to Kubernetes.
+Kubernetes already supports [PodGroup-scoped DRA claims](https://kubernetes.io/docs/concepts/resource-management/dynamic-resource-allocation/dra-api/#workload-resourceclaims).
+The scheduler creates the PodGroup reservation during allocation, avoiding
+this VEP's initial VM-reservation gap. KubeVirt could create one PodGroup per
+VM and generate matching Pod claim entries from the user's single VM
+declaration. However, when no Pod in the group is scheduled and its retained
+allocation is unavailable on all nodes, the scheduler's
+[PodGroup PostFilter](https://github.com/kubernetes/kubernetes/blob/master/pkg/scheduler/framework/plugins/dynamicresources/dynamicresources.go)
+may clear both the allocation and PodGroup reservation to try another device.
+That violates this VEP's requirement to remain Pending with the original
+device reserved when its node is unavailable. PodGroup DRA claims are also
+beta and disabled by default starting in Kubernetes v1.37, so using them
+would add a cluster-version and feature-gate dependency. A generic workload
+solution remains useful, but this VM guarantee can proceed with existing DRA
+claims and reservations.
+
+A template could instead select a specific device by a stable serial or other
+attribute, if the DRA driver publishes one. That prevents substitution but
+requires the user to choose the device before the first allocation. It does
+not reserve the device between launcher Pods, so another workload may take it
+and leave the VM Pending. This VEP lets the scheduler choose any matching
+device once, then retains that choice across launcher replacement.
 
 An external controller selected by a VM label would make opt-in apply to the
-whole VM. One VM may need to retain an NVMe allocation while stopped but
-release a GPU allocation; a label would need separate configuration mapping
-each claim to a retention policy. That mapping would duplicate the claim
-references in the VM template and could drift from them. The per-claim field
-keeps the policy with its reference. A dedicated reservation controller still
-isolates `reservedFor` write permission, while the feature gate controls new
-opt-ins. Cleanup must remain active for existing claims even if the gate is
-later disabled, so removing an add-on controller at that point would strand
+whole VM. To provide the per-claim retention semantics in this VEP, it would
+also need configuration mapping claim references to policies. That duplicates
+the VM template's claim entries and can drift from them. The per-claim field
+keeps the policy with its reference, while a dedicated reservation controller
+isolates `reservedFor` write permission. The feature gate controls new opt-ins;
+cleanup must remain active for existing claims even if the gate is later
+disabled. Removing an add-on controller at that point would strand
 reservations.
 
 ## Compatibility
@@ -333,18 +367,26 @@ reservation; claim ownership alone does not preserve the allocation.
   and orphan cleanup; gate-disabled cleanup; claim-specific restart gating;
   paired restart requests; terminal `Once` and `RerunOnFailure` cleanup;
   and status conflict retries.
-- Integration tests: template claim creation before VMI; same claim UID and
-  allocation across `virtctl restart`; deletion on `WhileRunning` stop;
+- Integration tests: template claim creation before VMI; same claim UID,
+  non-nil allocation, and `allocation.devices.results` across `virtctl restart`;
+  deletion on `WhileRunning` stop;
   retained claim and allocation on `Persistent` stop; stale condition blocks
   restart; source change is rejected until a `Persistent` claim is released;
   gate disablement leaves replacement Pending; unavailable node leaves
   replacement Pending; and VM deletion removes reservations and claims.
-- End-to-end tests with a DRA driver: confirm physical device identity across
-  launcher replacements under both policies and across stop/start only for
-  `Persistent`. Confirm `WhileRunning` releases its allocation on stop. Exercise
-  node loss, explicit release and recreation, rejected migration and
-  evacuation, and controller restart. Measure the allocation-to-reservation
-  interval.
+- End-to-end tests with a DRA driver: expose two matching NVMe devices with
+  distinct identities. Write a unique marker to the first device from the
+  guest, replace the launcher, and verify the same allocated driver, pool,
+  device, guest-visible NVMe serial, and marker. Read the marker without
+  writing to either candidate drive after restart. Claim UID alone cannot
+  prove device identity because an existing claim can be deallocated and
+  reallocated. Confirm identity
+  across launcher replacement under both policies and across stop/start only
+  for `Persistent`; confirm `WhileRunning` releases its allocation on stop.
+  Make the allocated node unavailable and verify that the replacement remains
+  Pending while its original allocation stays intact. Exercise explicit
+  release and recreation, rejected migration and evacuation, and controller
+  restart. Measure the allocation-to-reservation interval.
 
 ## Graduation Requirements
 
@@ -356,6 +398,8 @@ reservation; claim ownership alone does not preserve the allocation.
 - [ ] Intentional restart waits for `ReservationEstablished`.
 - [ ] Unit and integration tests cover allocation identity, run strategies,
       and both stop modes.
+- [ ] A real DRA device test confirms identity and guest data across launcher
+      replacement.
 - [ ] User documentation explains node pinning, reallocation, and the initial
   reservation gap.
 
